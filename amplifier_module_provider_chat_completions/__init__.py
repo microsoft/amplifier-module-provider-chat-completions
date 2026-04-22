@@ -1065,9 +1065,9 @@ class ChatCompletionsProvider:
         """
         return ProviderInfo(
             id=self.name,
-            display_name=f"Chat Completions ({self.name})"
+            display_name=f"OpenAI-Compatible ({self.name})"
             if self.name != "chat-completions"
-            else "Chat Completions",
+            else "OpenAI-Compatible",
             credential_env_vars=["CHAT_COMPLETIONS_API_KEY"],
             capabilities=["tools", "streaming", "json_mode"],
             defaults={
