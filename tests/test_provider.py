@@ -1547,10 +1547,17 @@ class TestConfigParsing:
         return ChatCompletionsProvider(config=config or {})
 
     def test_default_base_url(self, monkeypatch):
-        """base_url defaults to 'http://localhost:8080/v1' when not set."""
+        """Verifies the constructor leaves _base_url empty when env/config absent.
+
+        The wizard-visible default ("http://localhost:8080/v1") lives in the
+        ConfigField.default declaration inside get_info(), not in the constructor.
+        The constructor intentionally leaves _base_url empty so that the mount()
+        silent-skip guard fires and the client property raises a clear ValueError
+        when misconfigured, rather than silently connecting to a non-existent server.
+        """
         monkeypatch.delenv("CHAT_COMPLETIONS_BASE_URL", raising=False)
         provider = self._make_provider()
-        assert provider._base_url == "http://localhost:8080/v1"
+        assert provider._base_url == ""
 
     def test_custom_base_url(self, monkeypatch):
         """base_url from config overrides the default."""
@@ -1590,14 +1597,26 @@ class TestConfigParsing:
         assert provider._model == "my-custom-model"
 
     def test_default_max_tokens(self):
-        """max_tokens defaults to 4096."""
+        """_max_tokens is None when not explicitly configured (conditional-send pattern).
+
+        When max_tokens is absent from config, the provider omits it from API
+        params entirely so the server uses its own default (e.g. llama.cpp
+        n_predict=-1 = unlimited).  The wizard-visible default (4096) lives in
+        get_info().defaults, not in the constructor.
+        """
         provider = self._make_provider()
-        assert provider._max_tokens == 4096
+        assert provider._max_tokens is None
 
     def test_default_temperature(self):
-        """temperature defaults to 0.7."""
+        """_temperature is None when not explicitly configured (conditional-send pattern).
+
+        When temperature is absent from config, the provider omits it from API
+        params entirely so the server uses its own default temperature rather than
+        unconditionally overriding it with 0.7.  The wizard-visible default (0.7)
+        lives in get_info().defaults, not in the constructor.
+        """
         provider = self._make_provider()
-        assert provider._temperature == 0.7
+        assert provider._temperature is None
 
     def test_default_timeout(self):
         """timeout defaults to 300.0."""
