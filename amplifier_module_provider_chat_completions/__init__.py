@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from typing import Any
 
+import httpx
 import openai
 
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
@@ -43,6 +44,8 @@ from amplifier_core.message_models import (
     Usage,
 )
 from amplifier_core.content_models import TextContent, ThinkingContent, ToolCallContent
+
+from ._server_probe import ProbeResult, detect_ollama, probe_server
 
 __all__ = ["mount", "ChatCompletionsProvider", "ChatCompletionsChatResponse"]
 __amplifier_module_type__ = "provider"
@@ -210,9 +213,28 @@ class ChatCompletionsProvider:
             )
             _parsed_ctx = 0
         self._context_window: int = _parsed_ctx
-        # Sentinel: emit one-shot log per instance (avoid repeated log spam
-        # when list_models() is called by wizard + completion path + retries).
-        self._context_window_warn_emitted: bool = False
+
+        # Server-type probing configuration.
+        # auto_probe_context: opt-out flag for air-gapped setups or when
+        # probing is undesirable (NOT wizard-visible; settings.yaml escape hatch).
+        self._auto_probe_context: bool = self._config_bool(
+            self.config.get("auto_probe_context", True)
+        )
+        # auto_probe_timeout_seconds: per-probe timeout (NOT wizard-visible).
+        self._auto_probe_timeout_seconds: float = self._config_float(
+            self.config.get("auto_probe_timeout_seconds", 2.0), 2.0
+        )
+
+        # Async probe infrastructure (lazy-initialized).
+        self._httpx_client: httpx.AsyncClient | None = None
+        self._probe_cache: dict[str, ProbeResult] = {}  # keyed by model_id
+        self._probe_tasks: dict[str, asyncio.Task] = {}  # in-flight dedup sentinel
+        # Best probed context value for get_info() (populated by list_models()).
+        self._probed_context_window: int = 0
+        # Sentinels for one-shot logging.
+        self._drift_warn_emitted: bool = False  # config-vs-probe drift
+        self._context_log_emitted: set[str] = set()  # per-model resolution log
+        self._ollama_checked: bool = False  # advisory detection
 
     @property
     def client(self) -> openai.AsyncOpenAI:
@@ -904,61 +926,233 @@ class ChatCompletionsProvider:
         )
         return chat_response, None
 
+    # -------------------------------------------------------------------------
+    # Server-probing helpers
+    # -------------------------------------------------------------------------
+
+    async def _get_httpx_client(self) -> httpx.AsyncClient:
+        """Return (or lazily create) the httpx client used for server probes.
+
+        The client uses ``auto_probe_timeout_seconds`` as its base timeout.
+        The ``asyncio.wait_for`` per-probe timeout in ``probe_server()`` is the
+        real guard; the client timeout is a belt-and-suspenders fallback.
+
+        Returns:
+            A shared ``httpx.AsyncClient`` for this provider instance.
+        """
+        if self._httpx_client is None:
+            self._httpx_client = httpx.AsyncClient(
+                timeout=self._auto_probe_timeout_seconds
+            )
+        return self._httpx_client
+
+    async def _get_cached_probe(self, model_id: str) -> ProbeResult:
+        """Return a cached probe result for *model_id*, firing the probe if needed.
+
+        Implements an async-dedup pattern so that two concurrent ``list_models()``
+        callers for the same model share a single probe task rather than each
+        issuing independent HTTP requests.
+
+        Args:
+            model_id: The model identifier to probe.
+
+        Returns:
+            Cached or freshly computed :class:`ProbeResult`.
+        """
+        if model_id in self._probe_cache:
+            return self._probe_cache[model_id]
+
+        client = await self._get_httpx_client()
+
+        if model_id not in self._probe_tasks:
+            self._probe_tasks[model_id] = asyncio.create_task(
+                probe_server(
+                    self._base_url,
+                    model_id,
+                    http_client=client,
+                    timeout=self._auto_probe_timeout_seconds,
+                )
+            )
+
+        result = await self._probe_tasks[model_id]
+        self._probe_cache[model_id] = result
+        return result
+
+    async def _resolve_effective_context(self, sdk_model: Any) -> tuple[int, str]:
+        """Resolve the effective context window for a model.
+
+        Resolution order (first match wins):
+
+        1. Explicit config ``context_window > 0`` — user override, always wins.
+        2. Vendor extension on the ``/v1/models`` response (``max_model_len``,
+           ``loaded_context_length``) — free read, zero extra HTTP.
+        3. Server probe (cached, async-deduped) — llama.cpp / LM Studio / TGI.
+        4. ``0`` — honest "unknown".
+
+        When config wins but a probe has a different value, a one-shot drift
+        warning is logged (fire once per session to avoid log spam).
+
+        Args:
+            sdk_model: Model object from the OpenAI SDK ``models.list()``.
+
+        Returns:
+            Tuple of ``(context_window, source)`` where source is one of:
+            ``"config"``, ``"vendor-ext:{attr}"``, ``"probe:{server_type}"``,
+            ``"unknown"``.
+        """
+        # 1. Config wins unconditionally.
+        if self._context_window > 0:
+            # Run probe for drift detection (cached; no extra HTTP on repeat calls).
+            if self._auto_probe_context and not self._drift_warn_emitted:
+                try:
+                    probe = await self._get_cached_probe(sdk_model.id)
+                    if (
+                        probe.confidence == "high"
+                        and probe.context_window != self._context_window
+                    ):
+                        logger.warning(
+                            "chat-completions: configured context_window=%d but %s "
+                            "reports %d. Using configured value. If the server was "
+                            "reconfigured, update provider config or set "
+                            "context_window=0 to trust server auto-detection.",
+                            self._context_window,
+                            probe.source_endpoint,
+                            probe.context_window,
+                        )
+                        self._drift_warn_emitted = True
+                except Exception:
+                    pass  # Probe failure doesn't affect config-wins path.
+            return self._context_window, "config"
+
+        # 2. Free read from existing /v1/models response (vendor extensions).
+        for attr in ("max_model_len", "loaded_context_length"):
+            val = getattr(sdk_model, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val, f"vendor-ext:{attr}"
+
+        # 3. Server probe (cached; zero cost on repeat calls).
+        if self._auto_probe_context:
+            try:
+                probe = await self._get_cached_probe(sdk_model.id)
+                if probe.confidence == "high":
+                    return probe.context_window, f"probe:{probe.server_type}"
+            except Exception:
+                pass  # Probe failure falls through to "unknown".
+
+        return 0, "unknown"
+
+    async def _resolve_effective_max_output(self, sdk_model: Any) -> tuple[int, str]:
+        """Resolve the effective max output tokens for a model.
+
+        Currently uses the configured ``max_tokens`` value or the 4096 fallback.
+        The ``sdk_model`` parameter is accepted for API symmetry with
+        ``_resolve_effective_context`` and future extension.
+
+        Args:
+            sdk_model: Model object from the OpenAI SDK (currently unused).
+
+        Returns:
+            Tuple of ``(max_output_tokens, source)``.
+        """
+        if self._max_tokens is not None:
+            return self._max_tokens, "config"
+        return 4096, "fallback"
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
     async def list_models(self) -> list[ModelInfo]:
         """Return a list of models available on the server.
 
-        When ``filtered=True`` (the default), returns only the configured
-        model if found in the server's model list.  When ``filtered=False``,
-        returns all models from the server.
+        Fires server-type probing on the first call (when ``auto_probe_context``
+        is True) to populate ``context_window`` automatically for llama.cpp, LM
+        Studio, and TGI servers.  Reads ``max_model_len`` and
+        ``loaded_context_length`` vendor extensions from the standard
+        ``/v1/models`` response for free (zero extra HTTP).
+
+        When ``filtered=True`` (the default), returns only the configured model
+        if found in the server's model list.  When ``filtered=False``, returns
+        all models from the server.
 
         Returns:
             A list of :class:`~amplifier_core.models.ModelInfo` objects.  On
             failure, returns a one-element list containing the configured model.
         """
-        # One-shot log on first list_models() call per provider instance so
-        # the user knows whether kernel-side token budgeting is active.
-        if not self._context_window_warn_emitted:
-            if self._context_window == 0:
-                logger.warning(
-                    "chat-completions: context_window unknown. Requests will bypass kernel-side "
-                    "token budgeting. Set 'context_window' in provider config for manual override."
-                )
-            else:
-                logger.info(
-                    "chat-completions: context_window=%d, max_output_tokens=%d reported "
-                    "to kernel. Truncation requires a context-manager module that "
-                    "consumes these values.",
-                    self._context_window,
-                    self._max_tokens if self._max_tokens is not None else 4096,
-                )
-            self._context_window_warn_emitted = True
+        # Ollama advisory detection (once per session, async).
+        if self._auto_probe_context and not self._ollama_checked:
+            self._ollama_checked = True
+            try:
+                client = await self._get_httpx_client()
+                is_ollama = await detect_ollama(self._base_url, client)
+                if is_ollama:
+                    logger.info(
+                        "chat-completions: this base_url appears to be an Ollama server. "
+                        "Consider using provider-ollama instead — it handles num_ctx "
+                        "correctly and exposes additional Ollama features.",
+                    )
+            except Exception:
+                pass  # Advisory detection; never let it affect model listing.
 
         try:
             response = await self.client.models.list()
-            all_models = [
-                ModelInfo(
-                    id=model.id,
-                    display_name=model.id,
-                    context_window=self._context_window,
-                    max_output_tokens=self._max_tokens
-                    if self._max_tokens is not None
-                    else 4096,
-                    capabilities=["tools", "streaming"],
+            all_models: list[ModelInfo] = []
+            for model in response.data:
+                ctx, ctx_source = await self._resolve_effective_context(model)
+                max_out, _ = await self._resolve_effective_max_output(model)
+
+                # One-shot INFO log per model on first resolution.
+                if model.id not in self._context_log_emitted:
+                    self._context_log_emitted.add(model.id)
+                    if ctx == 0:
+                        logger.info(
+                            "chat-completions: context_window=0 for %s "
+                            "(source=unknown; kernel budgeting disabled)",
+                            model.id,
+                        )
+                    else:
+                        logger.info(
+                            "chat-completions: context_window=%d for %s (source=%s)",
+                            ctx,
+                            model.id,
+                            ctx_source,
+                        )
+
+                # Track best context for get_info() — prefer the configured model;
+                # fall back to the first model with a non-zero value.
+                if ctx > 0 and (
+                    model.id == self._model or self._probed_context_window == 0
+                ):
+                    self._probed_context_window = ctx
+
+                all_models.append(
+                    ModelInfo(
+                        id=model.id,
+                        display_name=model.id,
+                        context_window=ctx,
+                        max_output_tokens=max_out,
+                        capabilities=["tools", "streaming"],
+                    )
                 )
-                for model in response.data
-            ]
-            # Task 7: filtered mode — return only configured model when filtered=True
+
+            # Filtered mode — return only the configured model when filtered=True.
             if self._filtered and self._model and self._model != "default":
                 configured = [m for m in all_models if m.id == self._model]
                 return configured if configured else all_models[:1]
             return all_models
+
         except Exception as exc:
             logger.warning("Failed to list models from server: %s", exc)
+            effective_ctx = (
+                self._context_window
+                if self._context_window != 0
+                else self._probed_context_window
+            )
             return [
                 ModelInfo(
                     id=self._model,
                     display_name=self._model,
-                    context_window=self._context_window,
+                    context_window=effective_ctx,
                     max_output_tokens=self._max_tokens
                     if self._max_tokens is not None
                     else 4096,
@@ -1130,8 +1324,21 @@ class ChatCompletionsProvider:
             "temperature": 0.7,
             "timeout": 300.0,
         }
-        if self._context_window != 0:
-            defaults["context_window"] = self._context_window
+        # Effective context: config wins; fall through to probed value from
+        # list_models() (populated lazily on first wizard / routing call).
+        # get_info() is sync so it cannot await a probe; it reads whatever has
+        # been cached in self._probed_context_window by a prior list_models()
+        # call.  First-turn race: if list_models() was never called, this
+        # returns 0 and the kernel skips budgeting for turn 1.  PR 1's error
+        # message handles the resulting overflow; subsequent turns benefit from
+        # the probed value (probe fires during request processing).
+        effective_ctx = (
+            self._context_window
+            if self._context_window != 0
+            else self._probed_context_window
+        )
+        if effective_ctx != 0:
+            defaults["context_window"] = effective_ctx
         defaults["max_output_tokens"] = (
             self._max_tokens if self._max_tokens is not None else 4096
         )
@@ -1206,12 +1413,19 @@ class ChatCompletionsProvider:
     async def close(self) -> None:
         """Release any resources held by this provider.
 
-        Uses asyncio.shield so the client cleanup completes even if the
-        enclosing task is cancelled.  All exceptions are suppressed.
+        Closes both the OpenAI SDK client and the httpx client used for
+        server probing (if either was created).  Uses asyncio.shield so
+        cleanup completes even if the enclosing task is cancelled.  All
+        exceptions are suppressed.
         """
         if self._client is not None:
             try:
                 await asyncio.shield(self._client.close())
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._httpx_client is not None:
+            try:
+                await asyncio.shield(self._httpx_client.aclose())
             except (asyncio.CancelledError, Exception):
                 pass
 
