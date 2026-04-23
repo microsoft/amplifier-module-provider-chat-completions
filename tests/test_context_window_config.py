@@ -2,7 +2,8 @@
 
 Verifies that:
 1. Absent config → ModelInfo.context_window == 0, get_info().defaults has no
-   'context_window' key, and a WARNING is logged exactly once.
+   'context_window' key, and an INFO log noting budgeting is disabled is emitted
+   exactly once per model per session.
 2. context_window: "32768" (string) → ModelInfo reports 32768,
    get_info().defaults["context_window"] == 32768, no warning.
 3. context_window: 32768 (int, settings.yaml authors) → same as above.
@@ -11,8 +12,14 @@ Verifies that:
 5. Env var CHAT_COMPLETIONS_CONTEXT_WINDOW=16384 → honored when config absent.
 6. Both set → config field wins over env var.
 7. Both context_window and max_tokens populate get_info().defaults correctly.
-8. Warning emitted exactly once across multiple list_models() calls.
-9. INFO log emitted exactly once when context_window > 0.
+8. Log emitted exactly once per model per session (dedup via _context_log_emitted).
+9. INFO log emitted exactly once when context_window > 0 (shows "source=config").
+
+PR 3 note: the one-shot WARNING for context_window=0 from PR 2 has been replaced
+by a per-model INFO log with source attribution (PR 3 adds auto-detection, so the
+warning about "waiting for PR 3" is moot). Tests that exercised the WARNING are
+updated to check for the new INFO format.  ``auto_probe_context=False`` is passed
+to list-models helpers to prevent real network probe calls in CI environments.
 """
 
 import asyncio
@@ -41,8 +48,18 @@ def _fake_models_response(model_ids: list[str]):
 
 
 def _make_list_models_provider(**config_overrides) -> ChatCompletionsProvider:
-    """Create a provider wired to return specific model IDs from list_models()."""
-    config = {"model": "test-model", "filtered": False, **config_overrides}
+    """Create a provider wired to return specific model IDs from list_models().
+
+    Always sets ``auto_probe_context=False`` so these tests do not make real
+    network calls to probe endpoints.  Tests in test_server_probe.py cover the
+    probe path with proper HTTP mocking.
+    """
+    config = {
+        "model": "test-model",
+        "filtered": False,
+        "auto_probe_context": False,  # Prevent real network probe calls
+        **config_overrides,
+    }
     provider = ChatCompletionsProvider(config=config)
     provider._client = MagicMock()
     provider._client.models.list = AsyncMock(
@@ -80,26 +97,26 @@ class TestAbsentConfig:
         assert all(isinstance(m, ModelInfo) for m in models)
         assert all(m.context_window == 0 for m in models)
 
-    def test_warning_logged_when_context_window_zero(self, caplog):
-        """A WARNING is logged when context_window is 0 (unknown)."""
+    def test_log_emitted_when_context_window_zero(self, caplog):
+        """An INFO log is emitted when context_window is 0 (kernel budgeting disabled)."""
         provider = _make_list_models_provider()
 
         with caplog.at_level(
-            logging.WARNING,
+            logging.INFO,
             logger="amplifier_module_provider_chat_completions",
         ):
             asyncio.run(provider.list_models())
 
-        warning_records = [
+        info_records = [
             r
             for r in caplog.records
-            if r.levelno == logging.WARNING and "context_window" in r.getMessage()
+            if r.levelno == logging.INFO
+            and "context_window=0" in r.getMessage()
+            and "kernel budgeting disabled" in r.getMessage()
         ]
-        assert len(warning_records) >= 1, (
-            "Expected a WARNING log mentioning 'context_window' when value is 0"
-        )
-        assert "bypass" in warning_records[0].getMessage().lower() or (
-            "unknown" in warning_records[0].getMessage().lower()
+        assert len(info_records) >= 1, (
+            "Expected an INFO log mentioning 'context_window=0' and "
+            "'kernel budgeting disabled' when value is 0"
         )
 
 
@@ -319,58 +336,64 @@ class TestDefaultsPopulation:
 
 
 # ---------------------------------------------------------------------------
-# Case 8: Warning emitted exactly once across multiple list_models() calls
+# Case 8: Log emitted exactly once per model per session
 # ---------------------------------------------------------------------------
 
 
 class TestWarnOnce:
-    """One-shot warning: emitted exactly once per provider instance."""
+    """One-shot log: emitted exactly once per model per provider instance.
 
-    def test_warning_emitted_once_for_zero_context_window(self, caplog):
-        """WARNING about unknown context_window is logged exactly once."""
+    PR 3 note: the one-shot WARNING from PR 2 is replaced by a per-model INFO
+    log.  The dedup mechanism changed from a boolean ``_context_window_warn_emitted``
+    to a set ``_context_log_emitted`` keyed by model ID.
+    """
+
+    def test_log_emitted_once_for_zero_context_window(self, caplog):
+        """INFO log about budgeting disabled is logged exactly once per model."""
         provider = _make_list_models_provider()  # context_window=0
 
         with caplog.at_level(
-            logging.WARNING,
+            logging.INFO,
             logger="amplifier_module_provider_chat_completions",
         ):
             asyncio.run(provider.list_models())
             asyncio.run(provider.list_models())
             asyncio.run(provider.list_models())
 
-        bypass_warnings = [
+        disabled_logs = [
             r
             for r in caplog.records
-            if r.levelno == logging.WARNING and "bypass" in r.getMessage().lower()
+            if r.levelno == logging.INFO
+            and "kernel budgeting disabled" in r.getMessage()
         ]
-        assert len(bypass_warnings) == 1, (
-            f"Expected exactly 1 bypass warning, got {len(bypass_warnings)}"
+        assert len(disabled_logs) == 1, (
+            f"Expected exactly 1 'kernel budgeting disabled' INFO log, got {len(disabled_logs)}"
         )
 
     def test_sentinel_set_after_first_call(self):
-        """_context_window_warn_emitted is False initially, True after first call."""
+        """_context_log_emitted contains the model ID after first list_models() call."""
         provider = _make_list_models_provider()
-        assert provider._context_window_warn_emitted is False
+        assert "test-model" not in provider._context_log_emitted
         asyncio.run(provider.list_models())
-        assert provider._context_window_warn_emitted is True
+        assert "test-model" in provider._context_log_emitted
 
-    def test_sentinel_prevents_duplicate_warnings(self, caplog):
-        """Multiple list_models() calls do not produce multiple warnings."""
+    def test_sentinel_prevents_duplicate_logs(self, caplog):
+        """Multiple list_models() calls produce exactly one context log per model."""
         provider = _make_list_models_provider()  # context_window=0
 
         with caplog.at_level(
-            logging.WARNING,
+            logging.INFO,
             logger="amplifier_module_provider_chat_completions",
         ):
             for _ in range(5):
                 asyncio.run(provider.list_models())
 
-        bypass_warnings = [
+        ctx_logs = [
             r
             for r in caplog.records
-            if r.levelno == logging.WARNING and "bypass" in r.getMessage().lower()
+            if r.levelno == logging.INFO and "context_window=0" in r.getMessage()
         ]
-        assert len(bypass_warnings) == 1
+        assert len(ctx_logs) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +402,15 @@ class TestWarnOnce:
 
 
 class TestInfoLogOnce:
-    """One-shot INFO log when context_window > 0: emitted exactly once."""
+    """One-shot INFO log per model per provider session.
+
+    PR 3 note: Both context_window=0 and context_window>0 emit an INFO log.
+    The format is "context_window={n} for {model} (source={src})" where
+    source is "config", "vendor-ext:...", "probe:...", or "unknown".
+    """
 
     def test_info_logged_when_context_window_nonzero(self, caplog):
-        """An INFO log is emitted the first time list_models() runs with context_window > 0."""
+        """An INFO log with source=config is emitted when context_window > 0."""
         provider = _make_list_models_provider(context_window="32768")
 
         with caplog.at_level(
@@ -394,17 +422,18 @@ class TestInfoLogOnce:
         info_records = [
             r
             for r in caplog.records
-            if r.levelno == logging.INFO and "context_window" in r.getMessage()
+            if r.levelno == logging.INFO and "context_window=32768" in r.getMessage()
         ]
         assert len(info_records) >= 1, (
-            "Expected an INFO log mentioning 'context_window' when value > 0"
+            "Expected an INFO log with 'context_window=32768' when value > 0"
         )
         msg = info_records[0].getMessage()
         assert "32768" in msg
-        assert "max_output_tokens" in msg or "truncation" in msg.lower()
+        # PR 3: source attribution in log message.
+        assert "source=" in msg
 
     def test_info_logged_exactly_once(self, caplog):
-        """INFO log about context_window is emitted exactly once per instance."""
+        """INFO log about context_window is emitted exactly once per model per session."""
         provider = _make_list_models_provider(context_window="32768")
 
         with caplog.at_level(
@@ -418,14 +447,18 @@ class TestInfoLogOnce:
         info_records = [
             r
             for r in caplog.records
-            if r.levelno == logging.INFO and "context_window" in r.getMessage()
+            if r.levelno == logging.INFO and "context_window=32768" in r.getMessage()
         ]
         assert len(info_records) == 1, (
-            f"Expected exactly 1 INFO log about context_window, got {len(info_records)}"
+            f"Expected exactly 1 INFO log about context_window=32768, got {len(info_records)}"
         )
 
-    def test_no_info_log_when_context_window_zero(self, caplog):
-        """No 'context_window=...' INFO log when context_window is 0."""
+    def test_info_log_when_context_window_zero_says_budgeting_disabled(self, caplog):
+        """An INFO log with 'kernel budgeting disabled' is emitted when context_window=0.
+
+        PR 3 change: the per-model INFO log is now always emitted, not just when
+        context_window > 0. For unknown context (0), it says 'kernel budgeting disabled'.
+        """
         provider = _make_list_models_provider()  # context_window=0
 
         with caplog.at_level(
@@ -434,13 +467,15 @@ class TestInfoLogOnce:
         ):
             asyncio.run(provider.list_models())
 
-        # The INFO log only appears for context_window > 0
+        # PR 3 emits INFO for 0 with "kernel budgeting disabled".
         ctx_info = [
             r
             for r in caplog.records
-            if r.levelno == logging.INFO and "context_window=" in r.getMessage()
+            if r.levelno == logging.INFO
+            and "context_window=0" in r.getMessage()
+            and "kernel budgeting disabled" in r.getMessage()
         ]
-        assert len(ctx_info) == 0
+        assert len(ctx_info) == 1
 
 
 # ---------------------------------------------------------------------------
