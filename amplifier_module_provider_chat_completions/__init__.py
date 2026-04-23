@@ -149,11 +149,17 @@ class ChatCompletionsProvider:
         self._timeout: float = self._config_float(
             self.config.get("timeout", 300.0), 300.0
         )
-        self._temperature: float = self._config_float(
-            self.config.get("temperature", 0.7), 0.7
+        _temperature_val = self.config.get("temperature")
+        self._temperature: float | None = (
+            self._config_float(_temperature_val, 0.7)
+            if _temperature_val is not None
+            else None
         )
-        self._max_tokens: int = self._config_int(
-            self.config.get("max_tokens", 4096), 4096
+        _max_tokens_val = self.config.get("max_tokens")
+        self._max_tokens: int | None = (
+            self._config_int(_max_tokens_val, 4096)
+            if _max_tokens_val is not None
+            else None
         )
         self._max_retries: int = self._config_int(self.config.get("max_retries", 3), 3)
         self._min_retry_delay: float = self._config_float(
@@ -209,6 +215,51 @@ class ChatCompletionsProvider:
             )
         return self._client
 
+    @staticmethod
+    def _extract_structured_error(exc: Exception) -> dict[str, Any] | None:
+        """Extract the server's structured error body when the SDK preserves it.
+
+        Many OpenAI-compatible servers (llama.cpp, LM Studio, OpenAI, vLLM) return
+        typed error bodies like ``{"error": {"type": "...", "code": ..., ...}}``.
+        The OpenAI SDK surfaces this via ``exc.body``. Returns the inner ``error``
+        dict if it's a dict, otherwise the full body dict (when body is itself a dict),
+        otherwise None.
+        """
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            inner = body.get("error")
+            if isinstance(inner, dict):
+                return inner
+            return body
+        return None
+
+    @staticmethod
+    def _format_context_error_message(
+        exc: Exception, structured: dict[str, Any] | None
+    ) -> str:
+        """Build a user-facing message that surfaces the server's diagnostic fields.
+
+        When llama.cpp / compatible servers reject for context overflow they
+        typically return ``n_prompt_tokens`` and ``n_ctx`` in the error body.
+        Surfacing those directly tells the user exactly how far over the limit
+        they are and what to do about it, rather than burying it in a generic
+        ``InvalidRequestError`` stack.
+        """
+        base = str(exc)
+        if not isinstance(structured, dict):
+            return base
+        n_prompt = structured.get("n_prompt_tokens")
+        n_ctx = structured.get("n_ctx")
+        if n_prompt is not None and n_ctx is not None:
+            return (
+                f"Context overflow: prompt is {n_prompt} tokens but the server's runtime "
+                f"context is {n_ctx} tokens. Reduce the prompt/bundle size, or increase your "
+                f"server's maximum context (e.g. llama.cpp `--ctx-size` / `--parallel`, "
+                f"vLLM `--max-model-len`, TGI `--max-total-tokens`). "
+                f"Server error: {base}"
+            )
+        return base
+
     def _translate_error(self, exc: Exception) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
 
@@ -253,9 +304,25 @@ class ChatCompletionsProvider:
             )
         elif isinstance(exc, openai.BadRequestError):
             msg = str(exc).lower()
-            if "context length" in msg or "too many tokens" in msg:
+            structured = self._extract_structured_error(exc)
+            # Detect context-overflow variants across OpenAI-compatible servers:
+            #   OpenAI / Azure / vLLM:   "context length", "too many tokens"
+            #   llama.cpp:               "context size", "exceed_context_size_error"
+            #   LM Studio / misc:        "context window"
+            is_context_error = (
+                "context length" in msg
+                or "context size" in msg
+                or "context window" in msg
+                or "too many tokens" in msg
+                or "exceed_context_size_error" in msg
+                or (
+                    isinstance(structured, dict)
+                    and structured.get("type") == "exceed_context_size_error"
+                )
+            )
+            if is_context_error:
                 err = KernelContextLengthError(
-                    str(exc),
+                    self._format_context_error_message(exc, structured),
                     provider=provider,
                     model=model,
                     retryable=False,
@@ -714,6 +781,10 @@ class ChatCompletionsProvider:
             tools=wire_tools,
             stream=False,
         )
+        if self._max_tokens is not None:
+            params["max_tokens"] = self._max_tokens
+        if self._temperature is not None:
+            params["temperature"] = self._temperature
         # Task 5: Add optional generation params when configured
         if self._top_p is not None:
             params["top_p"] = self._top_p
@@ -768,6 +839,10 @@ class ChatCompletionsProvider:
             tools=wire_tools,
             stream=True,
         )
+        if self._max_tokens is not None:
+            params["max_tokens"] = self._max_tokens
+        if self._temperature is not None:
+            params["temperature"] = self._temperature
         # Task 5: Add optional generation params when configured
         if self._top_p is not None:
             params["top_p"] = self._top_p
@@ -898,7 +973,9 @@ class ChatCompletionsProvider:
                     id=model.id,
                     display_name=model.id,
                     context_window=0,
-                    max_output_tokens=self._max_tokens,
+                    max_output_tokens=self._max_tokens
+                    if self._max_tokens is not None
+                    else 0,
                     capabilities=["tools", "streaming"],
                 )
                 for model in response.data
@@ -915,7 +992,9 @@ class ChatCompletionsProvider:
                     id=self._model,
                     display_name=self._model,
                     context_window=0,
-                    max_output_tokens=self._max_tokens,
+                    max_output_tokens=self._max_tokens
+                    if self._max_tokens is not None
+                    else 0,
                 )
             ]
 
