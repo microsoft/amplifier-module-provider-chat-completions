@@ -149,11 +149,17 @@ class ChatCompletionsProvider:
         self._timeout: float = self._config_float(
             self.config.get("timeout", 300.0), 300.0
         )
-        self._temperature: float = self._config_float(
-            self.config.get("temperature", 0.7), 0.7
+        _temperature_val = self.config.get("temperature")
+        self._temperature: float | None = (
+            self._config_float(_temperature_val, 0.7)
+            if _temperature_val is not None
+            else None
         )
-        self._max_tokens: int = self._config_int(
-            self.config.get("max_tokens", 4096), 4096
+        _max_tokens_val = self.config.get("max_tokens")
+        self._max_tokens: int | None = (
+            self._config_int(_max_tokens_val, 4096)
+            if _max_tokens_val is not None
+            else None
         )
         self._max_retries: int = self._config_int(self.config.get("max_retries", 3), 3)
         self._min_retry_delay: float = self._config_float(
@@ -189,6 +195,24 @@ class ChatCompletionsProvider:
 
         # Task 8: raw
         self._raw: bool = self._config_bool(self.config.get("raw", False))
+
+        # Context window: user-configurable kernel budget hint.
+        # Resolution order: config field wins over env var, then default 0.
+        # 0 means "unknown" — context-managers will skip token budgeting.
+        _ctx_window_val = self.config.get("context_window")
+        if _ctx_window_val is None:
+            _ctx_window_val = os.environ.get("CHAT_COMPLETIONS_CONTEXT_WINDOW")
+        _parsed_ctx = self._config_int(_ctx_window_val, 0)
+        if _parsed_ctx < 0:
+            logger.warning(
+                "chat-completions: context_window=%d is negative; resetting to 0 (unknown).",
+                _parsed_ctx,
+            )
+            _parsed_ctx = 0
+        self._context_window: int = _parsed_ctx
+        # Sentinel: emit one-shot log per instance (avoid repeated log spam
+        # when list_models() is called by wizard + completion path + retries).
+        self._context_window_warn_emitted: bool = False
 
     @property
     def client(self) -> openai.AsyncOpenAI:
@@ -891,14 +915,34 @@ class ChatCompletionsProvider:
             A list of :class:`~amplifier_core.models.ModelInfo` objects.  On
             failure, returns a one-element list containing the configured model.
         """
+        # One-shot log on first list_models() call per provider instance so
+        # the user knows whether kernel-side token budgeting is active.
+        if not self._context_window_warn_emitted:
+            if self._context_window == 0:
+                logger.warning(
+                    "chat-completions: context_window unknown. Requests will bypass kernel-side "
+                    "token budgeting. Set 'context_window' in provider config for manual override."
+                )
+            else:
+                logger.info(
+                    "chat-completions: context_window=%d, max_output_tokens=%d reported "
+                    "to kernel. Truncation requires a context-manager module that "
+                    "consumes these values.",
+                    self._context_window,
+                    self._max_tokens if self._max_tokens is not None else 4096,
+                )
+            self._context_window_warn_emitted = True
+
         try:
             response = await self.client.models.list()
             all_models = [
                 ModelInfo(
                     id=model.id,
                     display_name=model.id,
-                    context_window=0,
-                    max_output_tokens=self._max_tokens,
+                    context_window=self._context_window,
+                    max_output_tokens=self._max_tokens
+                    if self._max_tokens is not None
+                    else 4096,
                     capabilities=["tools", "streaming"],
                 )
                 for model in response.data
@@ -914,8 +958,10 @@ class ChatCompletionsProvider:
                 ModelInfo(
                     id=self._model,
                     display_name=self._model,
-                    context_window=0,
-                    max_output_tokens=self._max_tokens,
+                    context_window=self._context_window,
+                    max_output_tokens=self._max_tokens
+                    if self._max_tokens is not None
+                    else 4096,
                 )
             ]
 
@@ -1063,6 +1109,33 @@ class ChatCompletionsProvider:
             credential environment variables, capabilities, defaults, and
             all config field declarations.
         """
+        # Build defaults dict for context-manager budget math.
+        #
+        # context_window: only included when non-zero.  When absent, context-managers
+        # skip token budgeting (fall through to their own fallback).
+        #
+        # max_output_tokens: ALWAYS included so context-managers can compute
+        #   budget = context_window - max_output_tokens - system_overhead.
+        # If this key is absent but context_window is present the cascade may
+        # fall back to a 200k default, silently over-budgeting.  Use 4096 as a
+        # conservative fallback that matches the old always-4096 wire behaviour
+        # for budget-math purposes (we no longer cap the actual API call, but the
+        # reservation stays at 4096 when the user has not configured max_tokens).
+        #
+        # Always populate BOTH keys whenever EITHER is set — a half-populated
+        # defaults dict is worse than an empty one.
+        defaults: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "timeout": 300.0,
+        }
+        if self._context_window != 0:
+            defaults["context_window"] = self._context_window
+        defaults["max_output_tokens"] = (
+            self._max_tokens if self._max_tokens is not None else 4096
+        )
+
         return ProviderInfo(
             id=self.name,
             display_name=f"OpenAI-Compatible ({self.name})"
@@ -1070,14 +1143,10 @@ class ChatCompletionsProvider:
             else "OpenAI-Compatible",
             credential_env_vars=["CHAT_COMPLETIONS_API_KEY"],
             capabilities=["tools", "streaming", "json_mode"],
-            defaults={
-                "model": self._model,
-                "max_tokens": 4096,
-                "temperature": 0.7,
-                "timeout": 300.0,
-            },
+            defaults=defaults,
             # Wizard exposes only the fields a real user has to think about
-            # the first time they add this provider: api_key, base_url, priority.
+            # the first time they add this provider: api_key, base_url, priority,
+            # and context_window (so the kernel can budget token usage).
             #
             # `model` is deliberately NOT declared here. app-cli's wizard has a
             # dedicated "Default Model" phase (provider_config_utils.configure_provider
@@ -1117,6 +1186,19 @@ class ChatCompletionsProvider:
                     prompt="Provider selection priority (lower = preferred, 0 = promoted by spawn_utils)",
                     required=False,
                     default="100",
+                ),
+                ConfigField(
+                    id="context_window",
+                    display_name="Context Window Override",
+                    field_type="text",
+                    prompt=(
+                        "Your server's per-request context in tokens. Set 0 to skip "
+                        "kernel-side budgeting. For llama.cpp: --ctx-size divided by "
+                        "--parallel. NOT the model's training context."
+                    ),
+                    env_var="CHAT_COMPLETIONS_CONTEXT_WINDOW",
+                    required=False,
+                    default="0",
                 ),
             ],
         )

@@ -49,6 +49,45 @@ Tested against:
 | `filtered` | bool | `true` | — |
 | `raw` | bool | `false` | — |
 
+## Context Window Configuration
+
+By default the provider reports `context_window = 0` for every model, which tells
+the kernel "unknown" — context-managers skip token budgeting entirely and the full
+conversation is sent verbatim. Against a server with a finite runtime context
+(llama.cpp, LM Studio, vLLM, …) this will eventually cause overflow errors.
+
+Set `context_window` to the **per-slot runtime context** of your server:
+
+| Config key | Env var | Default | Description |
+|---|---|---|---|
+| `context_window` | `CHAT_COMPLETIONS_CONTEXT_WINDOW` | `0` | Per-request token budget, or `0` to disable budgeting |
+
+> **The llama.cpp trap:** the correct value is `--ctx-size / --parallel` (tokens
+> per slot), *not* the model's training context window (e.g. 128 K). Example: if
+> you run `llama-server --ctx-size 16384 --parallel 4`, set `context_window: 4096`.
+
+```yaml
+# settings.yaml
+providers:
+  - module: provider-chat-completions
+    context_window: 4096    # --ctx-size 16384 / --parallel 4
+    max_tokens: 1024
+```
+
+Once set, the kernel's context-manager modules (`context-simple`,
+`context-persistent`, `context-managed`) will use this value to compute a token
+budget and truncate or compact the conversation before it reaches the server.
+
+> **Note:** Kernel-side budgeting only engages when a context-manager module is
+> mounted alongside this provider. If you use `loop-basic` without a
+> context-manager, the value is recorded but has no effect on truncation.
+
+For the architecture details and the full tracing of how the budget value flows
+through the kernel, see
+[`docs/designs/001-pr2-context-window-config.md`](../docs/designs/001-pr2-context-window-config.md)
+(if the `docs/` directory is present in your checkout; otherwise refer to the
+inline explanation above).
+
 ## Silent-skip behavior
 
 If `base_url` is not configured in either the module config or
