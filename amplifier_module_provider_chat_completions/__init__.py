@@ -1034,6 +1034,10 @@ class ChatCompletionsProvider:
                     "output_tokens": chat_response.usage.output_tokens,
                     "total_tokens": chat_response.usage.total_tokens,
                 }
+                if chat_response.usage.cache_read_tokens is not None:
+                    usage_dict["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                if chat_response.usage.cache_write_tokens is not None:
+                    usage_dict["cache_write_tokens"] = chat_response.usage.cache_write_tokens
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
