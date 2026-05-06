@@ -676,10 +676,17 @@ class ChatCompletionsProvider:
         # Usage mapping: OpenAI prompt/completion → kernel input/output.
         usage: Usage | None = None
         if response.usage:
+            usage_obj = response.usage
+            prompt_tokens = usage_obj.prompt_tokens
+            completion_tokens = usage_obj.completion_tokens
+            cached = 0
+            if hasattr(usage_obj, "prompt_tokens_details") and usage_obj.prompt_tokens_details:
+                cached = getattr(usage_obj.prompt_tokens_details, "cached_tokens", 0) or 0
             usage = Usage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                cache_read_tokens=cached or None,
             )
 
         return ChatCompletionsChatResponse(
@@ -864,10 +871,16 @@ class ChatCompletionsProvider:
         # Map usage if captured from the stream.
         usage_obj: Usage | None = None
         if usage is not None:
+            s_prompt = getattr(usage, "prompt_tokens", 0)
+            s_completion = getattr(usage, "completion_tokens", 0)
+            s_cached = 0
+            if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
+                s_cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
             usage_obj = Usage(
-                input_tokens=getattr(usage, "prompt_tokens", 0),
-                output_tokens=getattr(usage, "completion_tokens", 0),
-                total_tokens=getattr(usage, "total_tokens", 0),
+                input_tokens=s_prompt,
+                output_tokens=s_completion,
+                total_tokens=s_prompt + s_completion,
+                cache_read_tokens=s_cached or None,
             )
 
         chat_response = ChatCompletionsChatResponse(
@@ -1021,6 +1034,10 @@ class ChatCompletionsProvider:
                     "output_tokens": chat_response.usage.output_tokens,
                     "total_tokens": chat_response.usage.total_tokens,
                 }
+                if chat_response.usage.cache_read_tokens is not None:
+                    usage_dict["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                if chat_response.usage.cache_write_tokens is not None:
+                    usage_dict["cache_write_tokens"] = chat_response.usage.cache_write_tokens
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
