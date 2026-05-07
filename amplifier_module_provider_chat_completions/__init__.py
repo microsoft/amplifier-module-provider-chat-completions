@@ -10,9 +10,12 @@ import logging
 import os
 import time
 from collections import defaultdict
+from decimal import Decimal
 from typing import Any
 
 import openai
+
+from ._cost import compute_cost
 
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
@@ -680,14 +683,27 @@ class ChatCompletionsProvider:
             prompt_tokens = usage_obj.prompt_tokens
             completion_tokens = usage_obj.completion_tokens
             cached = 0
-            if hasattr(usage_obj, "prompt_tokens_details") and usage_obj.prompt_tokens_details:
-                cached = getattr(usage_obj.prompt_tokens_details, "cached_tokens", 0) or 0
+            if (
+                hasattr(usage_obj, "prompt_tokens_details")
+                and usage_obj.prompt_tokens_details
+            ):
+                cached = (
+                    getattr(usage_obj.prompt_tokens_details, "cached_tokens", 0) or 0
+                )
             usage = Usage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
                 cache_read_tokens=cached or None,
             )
+            _cost = compute_cost(
+                response.model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached,
+            )
+            if _cost is not None:
+                usage = usage.model_copy(update={"cost_usd": str(_cost)})
 
         return ChatCompletionsChatResponse(
             content=content,
@@ -882,6 +898,14 @@ class ChatCompletionsProvider:
                 total_tokens=s_prompt + s_completion,
                 cache_read_tokens=s_cached or None,
             )
+            _s_cost = compute_cost(
+                model,
+                prompt_tokens=s_prompt,
+                completion_tokens=s_completion,
+                cached_tokens=s_cached,
+            )
+            if _s_cost is not None:
+                usage_obj = usage_obj.model_copy(update={"cost_usd": str(_s_cost)})
 
         chat_response = ChatCompletionsChatResponse(
             content=content,
@@ -1035,9 +1059,17 @@ class ChatCompletionsProvider:
                     "total_tokens": chat_response.usage.total_tokens,
                 }
                 if chat_response.usage.cache_read_tokens is not None:
-                    usage_dict["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                    usage_dict["cache_read_tokens"] = (
+                        chat_response.usage.cache_read_tokens
+                    )
                 if chat_response.usage.cache_write_tokens is not None:
-                    usage_dict["cache_write_tokens"] = chat_response.usage.cache_write_tokens
+                    usage_dict["cache_write_tokens"] = (
+                        chat_response.usage.cache_write_tokens
+                    )
+                _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                usage_dict["cost_usd"] = (
+                    str(_cost_usd) if _cost_usd is not None else None
+                )
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
@@ -1165,6 +1197,28 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
         An async cleanup function that closes the provider, or None if skipped.
     """
     config = config or {}
+
+    # ---------------------------------------------------------------------------
+    # Cost accumulation hook and session.cost contributor
+    # ---------------------------------------------------------------------------
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    async def _accumulate(event: str, data: dict) -> None:
+        raw = (data.get("usage") or {}).get("cost_usd")
+        if raw is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+                str(raw)
+            )
+            _totals["has_data"] = True
+
+    if hasattr(coordinator, "hooks"):
+        coordinator.hooks.register("llm:response", _accumulate)
+    if hasattr(coordinator, "register_contributor"):
+        coordinator.register_contributor(
+            "session.cost",
+            "provider-chat-completions",
+            lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+        )
 
     # Resolve base_url: config takes precedence, then env var
     base_url = config.get("base_url") or os.environ.get("CHAT_COMPLETIONS_BASE_URL", "")
