@@ -693,7 +693,7 @@ class ChatCompletionsProvider:
             usage = Usage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
+                total_tokens=getattr(usage_obj, "total_tokens", prompt_tokens + completion_tokens),
                 cache_read_tokens=cached or None,
             )
             _cost = compute_cost(
@@ -703,7 +703,7 @@ class ChatCompletionsProvider:
                 cached_tokens=cached,
             )
             if _cost is not None:
-                usage = usage.model_copy(update={"cost_usd": str(_cost)})
+                usage = usage.model_copy(update={"cost_usd": _cost})
 
         return ChatCompletionsChatResponse(
             content=content,
@@ -895,7 +895,7 @@ class ChatCompletionsProvider:
             usage_obj = Usage(
                 input_tokens=s_prompt,
                 output_tokens=s_completion,
-                total_tokens=s_prompt + s_completion,
+                total_tokens=getattr(usage, "total_tokens", s_prompt + s_completion),
                 cache_read_tokens=s_cached or None,
             )
             _s_cost = compute_cost(
@@ -905,7 +905,7 @@ class ChatCompletionsProvider:
                 cached_tokens=s_cached,
             )
             if _s_cost is not None:
-                usage_obj = usage_obj.model_copy(update={"cost_usd": str(_s_cost)})
+                usage_obj = usage_obj.model_copy(update={"cost_usd": _s_cost})
 
         chat_response = ChatCompletionsChatResponse(
             content=content,
@@ -1211,14 +1211,12 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
             )
             _totals["has_data"] = True
 
-    if hasattr(coordinator, "hooks"):
-        coordinator.hooks.register("llm:response", _accumulate)
-    if hasattr(coordinator, "register_contributor"):
-        coordinator.register_contributor(
-            "session.cost",
-            "provider-chat-completions",
-            lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
-        )
+    coordinator.hooks.register("llm:response", _accumulate)
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-chat-completions",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
 
     # Resolve base_url: config takes precedence, then env var
     base_url = config.get("base_url") or os.environ.get("CHAT_COMPLETIONS_BASE_URL", "")

@@ -270,6 +270,6 @@ def test_cost_usd_stamped_on_usage_for_known_model():
     expected = Decimal("1000") * Decimal("2.50") / Decimal("1000000") + Decimal(
         "200"
     ) * Decimal("10.00") / Decimal("1000000")
-    assert Decimal(str(result.usage.cost_usd)) == expected, (
+    assert result.usage.cost_usd == expected, (
         f"Expected {expected!r}, got {result.usage.cost_usd!r}"
     )
