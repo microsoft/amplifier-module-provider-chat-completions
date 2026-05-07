@@ -1067,9 +1067,7 @@ class ChatCompletionsProvider:
                         chat_response.usage.cache_write_tokens
                     )
                 _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                usage_dict["cost_usd"] = (
-                    str(_cost_usd) if _cost_usd is not None else None
-                )
+                usage_dict["cost_usd"] = _cost_usd
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
