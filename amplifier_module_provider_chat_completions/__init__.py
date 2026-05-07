@@ -1198,9 +1198,6 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     """
     config = config or {}
 
-    # ---------------------------------------------------------------------------
-    # Cost accumulation hook and session.cost contributor
-    # ---------------------------------------------------------------------------
     # Resolve base_url: config takes precedence, then env var
     base_url = config.get("base_url") or os.environ.get("CHAT_COMPLETIONS_BASE_URL", "")
     if not base_url:
