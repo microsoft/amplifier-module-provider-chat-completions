@@ -710,7 +710,7 @@ class ChatCompletionsProvider:
                 cached_tokens=cached,
             )
             if _cost is not None:
-                usage = usage.model_copy(update={"cost_usd": str(_cost)})
+                usage = usage.model_copy(update={"cost_usd": _cost})
 
         return ChatCompletionsChatResponse(
             content=content,
@@ -913,7 +913,7 @@ class ChatCompletionsProvider:
                 cached_tokens=s_cached,
             )
             if _s_cost is not None:
-                usage_obj = usage_obj.model_copy(update={"cost_usd": str(_s_cost)})
+                usage_obj = usage_obj.model_copy(update={"cost_usd": _s_cost})
 
         chat_response = ChatCompletionsChatResponse(
             content=content,
@@ -1219,14 +1219,12 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
             )
             _totals["has_data"] = True
 
-    if hasattr(coordinator, "hooks"):
-        coordinator.hooks.register("llm:response", _accumulate)
-    if hasattr(coordinator, "register_contributor"):
-        coordinator.register_contributor(
-            "session.cost",
-            "provider-chat-completions",
-            lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
-        )
+    coordinator.hooks.register("llm:response", _accumulate)
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-chat-completions",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
 
 
     # Resolve base_url: config takes precedence, then env var
