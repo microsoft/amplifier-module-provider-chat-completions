@@ -710,9 +710,7 @@ class ChatCompletionsProvider:
                 cached_tokens=cached,
             )
             if _cost is not None:
-                usage = usage.model_copy(update={"cost_usd": _cost})
-                if self._add_cost is not None:
-                    self._add_cost(_cost)
+                usage = usage.model_copy(update={"cost_usd": str(_cost)})
 
         return ChatCompletionsChatResponse(
             content=content,
@@ -915,9 +913,7 @@ class ChatCompletionsProvider:
                 cached_tokens=s_cached,
             )
             if _s_cost is not None:
-                usage_obj = usage_obj.model_copy(update={"cost_usd": _s_cost})
-                if self._add_cost is not None:
-                    self._add_cost(_s_cost)
+                usage_obj = usage_obj.model_copy(update={"cost_usd": str(_s_cost)})
 
         chat_response = ChatCompletionsChatResponse(
             content=content,
@@ -1079,7 +1075,9 @@ class ChatCompletionsProvider:
                         chat_response.usage.cache_write_tokens
                     )
                 _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                usage_dict["cost_usd"] = _cost_usd
+                usage_dict["cost_usd"] = (
+                    str(_cost_usd) if _cost_usd is not None else None
+                )
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
@@ -1208,14 +1206,28 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     """
     config = config or {}
 
-    _provider_name = str(config.get("name", "chat-completions"))
-
+    # ---------------------------------------------------------------------------
+    # Cost accumulation hook and session.cost contributor
+    # ---------------------------------------------------------------------------
     _totals: dict = {"cost_usd": None, "has_data": False}
 
-    def _add_cost(cost) -> None:
-        if cost is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+    async def _accumulate(event: str, data: dict) -> None:
+        raw = (data.get("usage") or {}).get("cost_usd")
+        if raw is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+                str(raw)
+            )
             _totals["has_data"] = True
+
+    if hasattr(coordinator, "hooks"):
+        coordinator.hooks.register("llm:response", _accumulate)
+    if hasattr(coordinator, "register_contributor"):
+        coordinator.register_contributor(
+            "session.cost",
+            "provider-chat-completions",
+            lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+        )
+
 
     # Resolve base_url: config takes precedence, then env var
     base_url = config.get("base_url") or os.environ.get("CHAT_COMPLETIONS_BASE_URL", "")
@@ -1224,7 +1236,7 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
         return None
 
     provider = ChatCompletionsProvider(
-        config=config, coordinator=coordinator, add_cost=_add_cost
+        config=config, coordinator=coordinator
     )
     if provider.name != "chat-completions":
         logger.warning(
@@ -1234,11 +1246,6 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
             provider.name,
         )
     await coordinator.mount("providers", provider, name=provider.name)
-    coordinator.register_contributor(
-        "session.cost",
-        f"provider-{_provider_name}",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
-    )
     logger.info(
         "chat-completions provider mounted (name=%s, base_url=%s)",
         provider.name,
