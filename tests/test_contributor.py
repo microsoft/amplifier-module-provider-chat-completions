@@ -273,3 +273,6 @@ def test_cost_usd_stamped_on_usage_for_known_model():
     assert result.usage.cost_usd == expected, (
         f"Expected {expected!r}, got {result.usage.cost_usd!r}"
     )
+    assert isinstance(result.usage.cost_usd, Decimal), (
+        f"cost_usd must be Decimal, got {type(result.usage.cost_usd)}"
+    )
