@@ -693,7 +693,9 @@ class ChatCompletionsProvider:
             usage = Usage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
-                total_tokens=getattr(usage_obj, "total_tokens", prompt_tokens + completion_tokens),
+                total_tokens=getattr(
+                    usage_obj, "total_tokens", prompt_tokens + completion_tokens
+                ),
                 cache_read_tokens=cached or None,
             )
             _cost = compute_cost(
@@ -1199,14 +1201,17 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     # ---------------------------------------------------------------------------
     # Cost accumulation hook and session.cost contributor
     # ---------------------------------------------------------------------------
+    _provider_name = str(config.get("name", "chat-completions"))
     _totals: dict = {"cost_usd": None, "has_data": False}
 
     async def _accumulate(event: str, data: dict) -> None:
+        if data.get("provider") != _provider_name:  # ignore events from other providers
+            return
         raw = (data.get("usage") or {}).get("cost_usd")
         if raw is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")) + Decimal(
-                str(raw)
-            )
+            _totals["cost_usd"] = (
+                _totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")
+            ) + Decimal(str(raw))
             _totals["has_data"] = True
 
     coordinator.hooks.register("llm:response", _accumulate)
