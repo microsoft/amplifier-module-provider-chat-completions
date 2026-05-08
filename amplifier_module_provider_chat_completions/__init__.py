@@ -1079,7 +1079,7 @@ class ChatCompletionsProvider:
                         chat_response.usage.cache_write_tokens
                     )
                 _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                usage_dict["cost_usd"] = _cost_usd
+                usage_dict["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
@@ -1241,7 +1241,7 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     coordinator.register_contributor(
         "session.cost",
         f"provider-{_provider_name}",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+        lambda: {"cost_usd": str(_totals["cost_usd"]) if _totals["cost_usd"] is not None else None} if _totals["has_data"] else None,
     )
     logger.info(
         "chat-completions provider mounted (name=%s, base_url=%s)",
