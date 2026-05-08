@@ -711,6 +711,8 @@ class ChatCompletionsProvider:
             )
             if _cost is not None:
                 usage = usage.model_copy(update={"cost_usd": _cost})
+                if self._add_cost is not None:
+                    self._add_cost(_cost)
 
         return ChatCompletionsChatResponse(
             content=content,
@@ -914,6 +916,8 @@ class ChatCompletionsProvider:
             )
             if _s_cost is not None:
                 usage_obj = usage_obj.model_copy(update={"cost_usd": _s_cost})
+                if self._add_cost is not None:
+                    self._add_cost(_s_cost)
 
         chat_response = ChatCompletionsChatResponse(
             content=content,
@@ -1204,6 +1208,12 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     """
     config = config or {}
 
+    _provider_name = str(config.get("name", "chat-completions"))
+
+    _totals: dict[str, Any] = {"cost_usd": Decimal("0")}
+
+    def _add_cost(cost: Decimal) -> None:
+        _totals["cost_usd"] += cost
 
     # Resolve base_url: config takes precedence, then env var
     base_url = config.get("base_url") or os.environ.get("CHAT_COMPLETIONS_BASE_URL", "")
@@ -1212,7 +1222,7 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
         return None
 
     provider = ChatCompletionsProvider(
-        config=config, coordinator=coordinator
+        config=config, coordinator=coordinator, add_cost=_add_cost
     )
     if provider.name != "chat-completions":
         logger.warning(
@@ -1222,6 +1232,9 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
             provider.name,
         )
     await coordinator.mount("providers", provider, name=provider.name)
+    coordinator.session.cost.register_contributor(
+        f"provider-{_provider_name}", lambda: _totals["cost_usd"]
+    )
     logger.info(
         "chat-completions provider mounted (name=%s, base_url=%s)",
         provider.name,
