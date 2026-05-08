@@ -799,6 +799,7 @@ class ChatCompletionsProvider:
             messages=wire_messages,
             tools=wire_tools,
             stream=True,
+            stream_options={"include_usage": True},
         )
         # Task 5: Add optional generation params when configured
         if self._top_p is not None:
