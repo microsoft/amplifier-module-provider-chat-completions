@@ -13,6 +13,7 @@ Tests verify:
 """
 
 import asyncio
+from decimal import Decimal
 import json
 import pytest
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -1952,3 +1953,208 @@ class TestPerInstanceName:
             r.levelno == logging.WARNING and "custom name" in r.getMessage()
             for r in caplog.records
         ), "Expected no custom-name warning when using the default provider name"
+
+
+# ---------------------------------------------------------------------------
+# Cost-accumulation callback regression tests (PR #8)
+# ---------------------------------------------------------------------------
+
+
+class TestMountCostCallback:
+    """Regression tests: mount() must wire _add_cost through the constructor.
+
+    Pre-fix bug: mount() registered a global ``llm:response`` hook listener
+    (_accumulate) to accumulate costs. When two providers were mounted in
+    the same coordinator, each provider's listener fired on every
+    ``llm:response`` event — including those emitted by other providers —
+    doubling reported costs.
+
+    Fix: _accumulate and its coordinator.hooks.register() call are removed.
+    mount() creates a per-provider ``_add_cost`` closure and passes it
+    through the ChatCompletionsProvider constructor. _build_response() (and
+    the streaming accumulator) call self._add_cost() directly, so only that
+    provider's own responses are counted.
+
+    Pre-fix failure mode for both tests below:
+        mount() called ChatCompletionsProvider(config=..., coordinator=...)
+        WITHOUT add_cost=_add_cost. provider._add_cost defaulted to None.
+        The guard in _build_response()
+            if self._add_cost is not None: self._add_cost(_cost)
+        never fired → _totals["cost_usd"] remained permanently None
+        → contributor lambda returned None → both assertions fail.
+    """
+
+    @staticmethod
+    def _make_coordinator():
+        class _FakeHooks:
+            def __init__(self):
+                self.events: list = []
+
+            async def emit(self, name: str, payload: dict) -> None:
+                self.events.append((name, payload))
+
+            def register(self, event_name: str, listener) -> None:  # pre-fix shim
+                pass
+
+        class _FakeCoordinator:
+            def __init__(self):
+                self.hooks = _FakeHooks()
+                self._mounted: dict = {}
+                self.contributors: dict = {}
+
+            async def mount(self, namespace, provider, *, name=None):
+                self._mounted[name or "default"] = provider
+
+            def register_contributor(self, namespace, contributor_id, fn):
+                self.contributors[contributor_id] = fn
+
+        return _FakeCoordinator()
+
+    @staticmethod
+    def _make_openai_response(
+        model: str = "gpt-4o-mini",
+        content: str = "hello",
+        prompt_tokens: int = 1_000,
+        completion_tokens: int = 200,
+    ):
+        message = MagicMock()
+        message.content = content
+        message.tool_calls = None
+        message.reasoning_content = None
+
+        choice = MagicMock()
+        choice.message = message
+        choice.finish_reason = "stop"
+
+        usage = MagicMock()
+        usage.prompt_tokens = prompt_tokens
+        usage.completion_tokens = completion_tokens
+        usage.total_tokens = prompt_tokens + completion_tokens
+        usage.prompt_tokens_details = None
+
+        response = MagicMock()
+        response.model = model
+        response.choices = [choice]
+        response.usage = usage
+        return response
+
+    @pytest.mark.asyncio
+    async def test_mount_wires_add_cost_callback(self):
+        """mount() must pass add_cost= to ChatCompletionsProvider so costs accumulate.
+
+        Contract: after mount() and a response for a pricing-table model, the
+        session.cost contributor must return {"cost_usd": "<expected Decimal>"}
+        — not None.
+
+        Expected (gpt-4o-mini, 1000 prompt + 200 completion):
+            1000 × $0.15/M input  = $0.000150
+            200  × $0.60/M output = $0.000120
+                                  = Decimal("0.00027")
+        """
+        from amplifier_module_provider_chat_completions._cost import compute_cost
+        import amplifier_module_provider_chat_completions as module
+
+        coordinator = self._make_coordinator()
+        await module.mount(
+            coordinator,
+            {
+                "base_url": "http://test:8080/v1",
+                "use_streaming": "false",
+                "max_retries": "0",
+            },
+        )
+        provider = coordinator._mounted.get("chat-completions")
+        assert provider is not None
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create.return_value = self._make_openai_response(
+            model="gpt-4o-mini",
+            prompt_tokens=1_000,
+            completion_tokens=200,
+        )
+        provider._client = mock_client
+
+        await provider.complete(
+            ChatRequest(
+                messages=[Message(role="user", content="hi")],
+                model="gpt-4o-mini",
+            )
+        )
+
+        contributor_fn = coordinator.contributors.get("provider-chat-completions")
+        assert contributor_fn is not None
+
+        result = contributor_fn()
+        assert result is not None, (
+            "Contributor must return a dict (not None) after a response with a "
+            "pricing-table model. REGRESSION: pre-fix mount() omitted add_cost= "
+            "so the guard in _build_response() never fired."
+        )
+        expected = Decimal("0.00027")
+        assert compute_cost("gpt-4o-mini", prompt_tokens=1_000, completion_tokens=200) == expected, (
+            "Pricing sanity check: _cost.py rates appear to have changed; "
+            "update expected= in this test to match the new rate"
+        )
+        assert result["cost_usd"] == str(expected)
+
+    @pytest.mark.asyncio
+    async def test_two_providers_accumulate_independently(self):
+        """Two providers in the same coordinator must accumulate independently.
+
+        Exercising provider-beta must not cause provider-alpha's contributor
+        to report a cost. Each provider's _add_cost closure captures its own
+        _totals dict.
+        """
+        from amplifier_module_provider_chat_completions._cost import compute_cost
+        import amplifier_module_provider_chat_completions as module
+
+        coordinator = self._make_coordinator()
+        await module.mount(
+            coordinator,
+            {
+                "name": "alpha",
+                "base_url": "http://alpha:8080/v1",
+                "use_streaming": "false",
+                "max_retries": "0",
+            },
+        )
+        await module.mount(
+            coordinator,
+            {
+                "name": "beta",
+                "base_url": "http://beta:8080/v1",
+                "use_streaming": "false",
+                "max_retries": "0",
+            },
+        )
+
+        provider_beta = coordinator._mounted.get("beta")
+        assert provider_beta is not None
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create.return_value = self._make_openai_response(
+            model="gpt-4o-mini",
+            prompt_tokens=1_000,
+            completion_tokens=200,
+        )
+        provider_beta._client = mock_client
+
+        await provider_beta.complete(
+            ChatRequest(
+                messages=[Message(role="user", content="hi")],
+                model="gpt-4o-mini",
+            )
+        )
+
+        alpha_fn = coordinator.contributors.get("provider-alpha")
+        assert alpha_fn is not None
+        assert alpha_fn() is None, (
+            "provider-alpha processed no responses; its contributor must return None. "
+            "Non-None means costs are leaking across provider instances."
+        )
+
+        beta_fn = coordinator.contributors.get("provider-beta")
+        assert beta_fn is not None
+        beta_result = beta_fn()
+        assert beta_result is not None
+        assert beta_result.get("cost_usd") == str(Decimal("0.00027"))
