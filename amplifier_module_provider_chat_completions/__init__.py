@@ -1212,12 +1212,9 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
 
     _totals: dict = {"cost_usd": None, "has_data": False}
 
-    async def _accumulate(event: str, data: dict) -> None:
-        raw = (data.get("usage") or {}).get("cost_usd")
-        if raw is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + (
-                raw if isinstance(raw, Decimal) else Decimal(str(raw))
-            )
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
             _totals["has_data"] = True
 
     # Resolve base_url: config takes precedence, then env var
@@ -1227,7 +1224,7 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
         return None
 
     provider = ChatCompletionsProvider(
-        config=config, coordinator=coordinator
+        config=config, coordinator=coordinator, add_cost=_add_cost
     )
     if provider.name != "chat-completions":
         logger.warning(
@@ -1237,7 +1234,6 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
             provider.name,
         )
     await coordinator.mount("providers", provider, name=provider.name)
-    coordinator.hooks.register("llm:response", _accumulate)
     coordinator.register_contributor(
         "session.cost",
         f"provider-{_provider_name}",
