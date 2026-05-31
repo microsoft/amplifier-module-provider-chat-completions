@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import defaultdict
 from decimal import Decimal
 from typing import Any
@@ -813,45 +814,175 @@ class ChatCompletionsProvider:
 
         stream = await self.client.chat.completions.create(**params)
 
-        async for chunk in stream:
-            # Capture usage if present on any chunk (typically the final one).
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage is not None:
-                usage = chunk_usage
+        # ── Streaming event state ────────────────────────────────────────────
+        # One request_id per call; shared across all llm:stream_* events.
+        request_id: str = str(uuid.uuid4())
+        # block_index -> next sequence number for deltas within that block
+        seq: dict[int, int] = {}
+        # block_index -> block_type string (for block_end lookup)
+        block_types: dict[int, str] = {}
+        # "thinking" | "text" | "tool_use:<tc_idx>" -> assigned block_index
+        block_index_map: dict[str, int] = {}
+        next_block_index: int = 0
+        # True once any llm:stream_* event has been emitted (guards stream_aborted)
+        partial_emitted: bool = False
+        # Evaluate coordinator guard once outside the hot loop
+        hooks_available: bool = self.coordinator is not None and hasattr(
+            self.coordinator, "hooks"
+        )
 
-            if not chunk.choices:
-                continue
+        try:
+            async for chunk in stream:
+                # Capture usage if present on any chunk (typically the final one).
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
 
-            choice = chunk.choices[0]
-            delta = choice.delta
+                if not chunk.choices:
+                    continue
 
-            # Track finish_reason from the last chunk that has one.
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
+                choice = chunk.choices[0]
+                delta = choice.delta
 
-            # Accumulate text content.
-            if delta.content:
-                text_buffer += delta.content
+                # Track finish_reason from the last chunk that has one.
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
 
-            # Accumulate reasoning/thinking content (provider-specific extension).
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                thinking_buffer += reasoning
+                # ── Reasoning / thinking deltas ──────────────────────────────
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    thinking_buffer += reasoning
+                    if "thinking" not in block_index_map:
+                        bidx = next_block_index
+                        block_index_map["thinking"] = bidx
+                        block_types[bidx] = "thinking"
+                        seq[bidx] = 0
+                        next_block_index += 1
+                        if hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_start",
+                                {
+                                    "request_id": request_id,
+                                    "block_index": bidx,
+                                    "block_type": "thinking",
+                                },
+                            )
+                            partial_emitted = True
+                    bidx = block_index_map["thinking"]
+                    if hooks_available:
+                        await self.coordinator.hooks.emit(
+                            "llm:stream_block_delta",
+                            {
+                                "request_id": request_id,
+                                "block_index": bidx,
+                                "block_type": "thinking",
+                                "sequence": seq[bidx],
+                                "text": reasoning,
+                            },
+                        )
+                        seq[bidx] += 1
+                        partial_emitted = True
 
-            # Accumulate tool call deltas by index.
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_call_accum:
-                        # First chunk for this index: capture id and name.
-                        tool_call_accum[idx] = {
-                            "id": tc_delta.id,
-                            "name": tc_delta.function.name,
-                            "arguments": "",
-                        }
-                    # All chunks: append to arguments.
-                    if tc_delta.function.arguments:
-                        tool_call_accum[idx]["arguments"] += tc_delta.function.arguments
+                # ── Text deltas ──────────────────────────────────────────────
+                if delta.content:
+                    text_buffer += delta.content
+                    if "text" not in block_index_map:
+                        bidx = next_block_index
+                        block_index_map["text"] = bidx
+                        block_types[bidx] = "text"
+                        seq[bidx] = 0
+                        next_block_index += 1
+                        if hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_start",
+                                {
+                                    "request_id": request_id,
+                                    "block_index": bidx,
+                                    "block_type": "text",
+                                },
+                            )
+                            partial_emitted = True
+                    bidx = block_index_map["text"]
+                    if hooks_available:
+                        await self.coordinator.hooks.emit(
+                            "llm:stream_block_delta",
+                            {
+                                "request_id": request_id,
+                                "block_index": bidx,
+                                "block_type": "text",
+                                "sequence": seq[bidx],
+                                "text": delta.content,
+                            },
+                        )
+                        seq[bidx] += 1
+                        partial_emitted = True
+
+                # ── Tool-call deltas ─────────────────────────────────────────
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_call_accum:
+                            # First chunk for this tc index: capture id and name.
+                            tool_call_accum[idx] = {
+                                "id": tc_delta.id,
+                                "name": tc_delta.function.name,
+                                "arguments": "",
+                            }
+                            # Emit block_start for this tool_use block.
+                            key = f"tool_use:{idx}"
+                            bidx = next_block_index
+                            block_index_map[key] = bidx
+                            block_types[bidx] = "tool_use"
+                            seq[bidx] = 0
+                            next_block_index += 1
+                            if hooks_available:
+                                start_payload: dict[str, Any] = {
+                                    "request_id": request_id,
+                                    "block_index": bidx,
+                                    "block_type": "tool_use",
+                                }
+                                fn_name = (
+                                    tc_delta.function.name
+                                    if tc_delta.function
+                                    else None
+                                )
+                                if fn_name:
+                                    start_payload["name"] = fn_name
+                                await self.coordinator.hooks.emit(
+                                    "llm:stream_block_start", start_payload
+                                )
+                                partial_emitted = True
+                        # All chunks: append to arguments.
+                        if tc_delta.function.arguments:
+                            tool_call_accum[idx]["arguments"] += (
+                                tc_delta.function.arguments
+                            )
+
+            # ── After loop: emit block_end for every started block ───────────
+            if hooks_available:
+                for bidx in sorted(block_types.keys()):
+                    await self.coordinator.hooks.emit(
+                        "llm:stream_block_end",
+                        {
+                            "request_id": request_id,
+                            "block_index": bidx,
+                            "block_type": block_types[bidx],
+                        },
+                    )
+
+        except Exception as _stream_exc:
+            if partial_emitted and hooks_available:
+                await self.coordinator.hooks.emit(
+                    "llm:stream_aborted",
+                    {
+                        "request_id": request_id,
+                        "error": {
+                            "type": type(_stream_exc).__name__,
+                            "msg": str(_stream_exc),
+                        },
+                    },
+                )
+            raise
 
         # Build content blocks from accumulated buffers.
         content: list[Any] = []
@@ -1032,9 +1163,18 @@ class ChatCompletionsProvider:
 
             await self._emit_event("llm:request", request_payload)
 
+            # Per-request stream override: metadata={"stream": False} forces the
+            # non-streaming path for this call only.  Uses an identity check (`is
+            # False`) so falsy-but-not-False values (e.g. 0) do NOT suppress
+            # streaming.  Must NOT mutate self._use_streaming.
+            _meta = getattr(request, "metadata", None)
+            _use_streaming = self._use_streaming
+            if isinstance(_meta, dict) and _meta.get("stream") is False:
+                _use_streaming = False
+
             try:
                 async with asyncio.timeout(self._timeout):
-                    if self._use_streaming:
+                    if _use_streaming:
                         (
                             chat_response,
                             raw_api_response,
@@ -1079,7 +1219,9 @@ class ChatCompletionsProvider:
                         chat_response.usage.cache_write_tokens
                     )
                 _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                usage_dict["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
+                usage_dict["cost_usd"] = (
+                    str(_cost_usd) if _cost_usd is not None else None
+                )
 
             # Task 8: Build llm:response event payload, include raw response when raw=True
             response_payload: dict[str, Any] = {
@@ -1237,7 +1379,15 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     coordinator.register_contributor(
         "session.cost",
         f"provider-{_provider_name}",
-        lambda: {"cost_usd": str(_totals["cost_usd"]) if _totals["cost_usd"] is not None else None} if _totals["has_data"] else None,
+        lambda: (
+            {
+                "cost_usd": str(_totals["cost_usd"])
+                if _totals["cost_usd"] is not None
+                else None
+            }
+            if _totals["has_data"]
+            else None
+        ),
     )
     logger.info(
         "chat-completions provider mounted (name=%s, base_url=%s)",
