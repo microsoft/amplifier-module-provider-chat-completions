@@ -871,10 +871,11 @@ class ChatCompletionsProvider:
                     bidx = block_index_map["thinking"]
                     if hooks_available:
                         await self.coordinator.hooks.emit(
-                            "llm:stream_thinking_delta",
+                            "llm:stream_block_delta",
                             {
                                 "request_id": request_id,
                                 "block_index": bidx,
+                                "block_type": "thinking",
                                 "sequence": seq[bidx],
                                 "text": reasoning,
                             },
@@ -908,6 +909,7 @@ class ChatCompletionsProvider:
                             {
                                 "request_id": request_id,
                                 "block_index": bidx,
+                                "block_type": "text",
                                 "sequence": seq[bidx],
                                 "text": delta.content,
                             },

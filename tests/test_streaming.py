@@ -2,12 +2,15 @@
 
 Contract reference: docs/provider-streaming-contract.md (in streaming-text repo).
 
-Five events, all sharing one request_id per call:
+Four events, all sharing one request_id per call:
   llm:stream_block_start  – once per block, before its deltas
-  llm:stream_block_delta  – each non-empty text fragment
-  llm:stream_thinking_delta – each non-empty reasoning fragment
+  llm:stream_block_delta  – each non-empty content fragment (text OR thinking);
+                            block_type ("text"|"thinking") carried on every delta
   llm:stream_block_end    – when a block completes
   llm:stream_aborted      – mid-stream exception AFTER partial emit
+
+There is NO separate llm:stream_thinking_delta event.  Both text and reasoning
+fragments use llm:stream_block_delta; consumers route on block_type.
 
 Per-request override:
   request.metadata == {"stream": False}  ->  non-streaming path (no stream_* events)
@@ -162,9 +165,10 @@ async def test_text_only_stream_emits_block_start_deltas_block_end():
     assert len(ends) == 1
     assert ends[0]["block_type"] == "text"
 
-    # Three deltas (one per non-empty content chunk)
+    # Three deltas (one per non-empty content chunk), each carrying block_type:"text"
     deltas = hooks.payloads_for("llm:stream_block_delta")
     assert len(deltas) == 3
+    assert all(d["block_type"] == "text" for d in deltas)
 
 
 @pytest.mark.asyncio
@@ -244,6 +248,7 @@ async def test_empty_content_fragment_not_emitted():
     # Exactly one delta for "ok"; empty string must not produce one
     assert len(deltas) == 1
     assert deltas[0]["text"] == "ok"
+    assert deltas[0]["block_type"] == "text"
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +257,12 @@ async def test_empty_content_fragment_not_emitted():
 
 
 @pytest.mark.asyncio
-async def test_reasoning_model_emits_thinking_before_text():
-    """thinking block emitted (with llm:stream_thinking_delta) before text block."""
+async def test_reasoning_model_emits_thinking_block_delta_before_text_block_delta():
+    """Thinking and text both use llm:stream_block_delta; block_type routes them.
+
+    Contract: ONE delta event for all content.  No llm:stream_thinking_delta.
+    Thinking deltas (block_type="thinking") come before text deltas (block_type="text").
+    """
     provider = _make_provider()
     chunks = [
         _make_mock_chunk(reasoning_content="step1"),
@@ -266,15 +275,27 @@ async def test_reasoning_model_emits_thinking_before_text():
     await provider.complete(_simple_request())
 
     hooks = provider.coordinator.hooks
-    names = [n for n, _ in hooks.stream_events()]
+    stream = hooks.stream_events()
+    names = [n for n, _ in stream]
 
-    assert "llm:stream_thinking_delta" in names
+    # No separate thinking_delta event -- merged into block_delta
+    assert "llm:stream_thinking_delta" not in names
     assert "llm:stream_block_delta" in names
 
-    # thinking_delta comes before block_delta
-    first_thinking = names.index("llm:stream_thinking_delta")
-    first_text = names.index("llm:stream_block_delta")
-    assert first_thinking < first_text
+    # All block_delta payloads carry block_type
+    all_deltas = hooks.payloads_for("llm:stream_block_delta")
+    assert all("block_type" in d for d in all_deltas)
+
+    # Thinking deltas (block_type="thinking") come before text deltas (block_type="text")
+    thinking_deltas = [(i, n) for i, (n, p) in enumerate(stream)
+                       if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"]
+    text_deltas = [(i, n) for i, (n, p) in enumerate(stream)
+                   if n == "llm:stream_block_delta" and p.get("block_type") == "text"]
+    assert thinking_deltas, "Expected at least one thinking block_delta"
+    assert text_deltas, "Expected at least one text block_delta"
+    assert thinking_deltas[-1][0] < text_deltas[0][0], (
+        "Last thinking delta must come before first text delta"
+    )
 
     # Exactly two block_starts: thinking (idx 0) and text (idx 1)
     starts = hooks.payloads_for("llm:stream_block_start")
@@ -292,8 +313,8 @@ async def test_reasoning_model_emits_thinking_before_text():
 
 
 @pytest.mark.asyncio
-async def test_thinking_delta_sequence_zero_based():
-    """thinking delta sequence numbers start at 0."""
+async def test_thinking_block_delta_sequence_zero_based():
+    """thinking block_delta sequence numbers start at 0 and are per-block."""
     provider = _make_provider()
     chunks = [
         _make_mock_chunk(reasoning_content="a"),
@@ -304,14 +325,16 @@ async def test_thinking_delta_sequence_zero_based():
 
     await provider.complete(_simple_request())
 
-    deltas = provider.coordinator.hooks.payloads_for("llm:stream_thinking_delta")
+    # Filter block_delta events to thinking blocks only
+    all_deltas = provider.coordinator.hooks.payloads_for("llm:stream_block_delta")
+    deltas = [d for d in all_deltas if d.get("block_type") == "thinking"]
     seqs = [d["sequence"] for d in deltas]
     assert seqs == [0, 1]
 
 
 @pytest.mark.asyncio
-async def test_thinking_delta_carries_text_field():
-    """llm:stream_thinking_delta payload has a 'text' field with the fragment."""
+async def test_thinking_block_delta_carries_block_type_and_text():
+    """llm:stream_block_delta for thinking carries block_type="thinking" and text."""
     provider = _make_provider()
     chunks = [
         _make_mock_chunk(reasoning_content="some reasoning"),
@@ -321,9 +344,11 @@ async def test_thinking_delta_carries_text_field():
 
     await provider.complete(_simple_request())
 
-    deltas = provider.coordinator.hooks.payloads_for("llm:stream_thinking_delta")
-    assert len(deltas) == 1
-    assert deltas[0]["text"] == "some reasoning"
+    all_deltas = provider.coordinator.hooks.payloads_for("llm:stream_block_delta")
+    thinking_deltas = [d for d in all_deltas if d.get("block_type") == "thinking"]
+    assert len(thinking_deltas) == 1
+    assert thinking_deltas[0]["text"] == "some reasoning"
+    assert thinking_deltas[0]["block_type"] == "thinking"
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +379,8 @@ async def test_tool_use_emits_block_start_and_block_end_no_arg_deltas():
     assert "llm:stream_block_start" in stream_names
     # block_end must appear
     assert "llm:stream_block_end" in stream_names
-    # No block_delta or thinking_delta for tool use
+    # No block_delta for tool use (tool-use blocks have no per-fragment deltas)
     assert "llm:stream_block_delta" not in stream_names
-    assert "llm:stream_thinking_delta" not in stream_names
 
     start = hooks.payloads_for("llm:stream_block_start")[0]
     assert start["block_type"] == "tool_use"
