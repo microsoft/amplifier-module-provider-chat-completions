@@ -644,10 +644,15 @@ class ChatCompletionsProvider:
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
         text_parts: list[str] = []
 
-        # Preserve any extended reasoning content as a ThinkingBlock.
+        # Do NOT persist reasoning_content as a ThinkingBlock: signed extended
+        # thinking does not exist on chat-completions APIs, so a thinking-shaped
+        # block here would carry signature=None -- a fabrication that Anthropic's
+        # strict signature validation rejects on session resume (issue #206).
+        # Reasoning is still surfaced for display via content_blocks (below),
+        # which is a UI-only field and is never persisted into message history
+        # or replayed back to the wire.
         reasoning_content = getattr(message, "reasoning_content", None)
         if reasoning_content:
-            content.append(ThinkingBlock(thinking=reasoning_content))
             event_blocks.append(ThinkingContent(text=reasoning_content))
 
         # Text content → TextBlock.
@@ -988,8 +993,14 @@ class ChatCompletionsProvider:
         content: list[Any] = []
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
 
+        # Do NOT persist the accumulated reasoning as a ThinkingBlock (see the
+        # matching comment in _build_response / issue #206). The live
+        # llm:stream_block_start/delta/end "thinking" events above already gave
+        # callers real-time visibility into reasoning; only the persisted
+        # message content is affected here. content_blocks (event_blocks) is a
+        # UI-only field, never replayed back to the wire, so it's still safe to
+        # surface reasoning there for display purposes.
         if thinking_buffer:
-            content.append(ThinkingBlock(thinking=thinking_buffer))
             event_blocks.append(ThinkingContent(text=thinking_buffer))
 
         if text_buffer:
