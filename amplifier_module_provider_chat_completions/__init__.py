@@ -644,10 +644,14 @@ class ChatCompletionsProvider:
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
         text_parts: list[str] = []
 
-        # Preserve any extended reasoning content as a ThinkingBlock.
+        # Surface extended reasoning content in the ephemeral UI stream only.
+        # Chat-completions APIs have no signed extended thinking, so a
+        # persisted ThinkingBlock here would carry signature=None -- which
+        # Anthropic strict-validates and rejects on session resume after a
+        # provider switch (amplifier-support#206). ThinkingContent is
+        # render-only and never replayed to a provider.
         reasoning_content = getattr(message, "reasoning_content", None)
         if reasoning_content:
-            content.append(ThinkingBlock(thinking=reasoning_content))
             event_blocks.append(ThinkingContent(text=reasoning_content))
 
         # Text content → TextBlock.
@@ -988,8 +992,10 @@ class ChatCompletionsProvider:
         content: list[Any] = []
         event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
 
+        # Ephemeral UI stream only -- see the matching comment in
+        # _build_response() for why a persisted ThinkingBlock is never
+        # constructed here (amplifier-support#206).
         if thinking_buffer:
-            content.append(ThinkingBlock(thinking=thinking_buffer))
             event_blocks.append(ThinkingContent(text=thinking_buffer))
 
         if text_buffer:
