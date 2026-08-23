@@ -199,6 +199,21 @@ class ChatCompletionsProvider:
         # Task 8: raw
         self._raw: bool = self._config_bool(self.config.get("raw", False))
 
+        # Optional default HTTP headers forwarded to the OpenAI client
+        # constructor (``default_headers=``), applied to every request. Named to
+        # match provider-anthropic, which likewise sets
+        # ``AsyncAnthropic(default_headers=...)`` from config. Needed to reach
+        # endpoints fronted by a WAF that blocks non-browser clients (e.g. a
+        # Runpod pod proxy behind Cloudflare returns 403 "error code: 1010"
+        # unless a browser-like User-Agent is sent); a User-Agent set here
+        # overrides the OpenAI SDK's default.
+        _default_headers = self.config.get("default_headers")
+        self._default_headers: dict[str, str] | None = (
+            {str(k): str(v) for k, v in _default_headers.items()}
+            if isinstance(_default_headers, dict)
+            else None
+        )
+
     @property
     def client(self) -> openai.AsyncOpenAI:
         """Lazily initialize the OpenAI client on first access."""
@@ -212,6 +227,7 @@ class ChatCompletionsProvider:
                 base_url=self._base_url,
                 api_key=self._api_key,
                 timeout=self._timeout,
+                default_headers=self._default_headers,
                 max_retries=0,  # Intentional: disables the openai SDK's built-in retry
                 # layer. The provider manages retries itself via
                 # retry_with_backoff() from amplifier-core.
@@ -603,7 +619,47 @@ class ChatCompletionsProvider:
 
             wire.append(msg)
 
-        return wire
+        # Coalesce system messages, mirroring provider-anthropic and
+        # provider-openai: both extract every system message regardless of
+        # position and join them with "\n\n". Those providers route the result
+        # to a top-level param (Anthropic ``system=``, OpenAI Responses
+        # ``instructions=``); the Chat Completions API has no such param, so the
+        # equivalent is a single LEADING system message. This also fixes the
+        # opaque HTTP 500 that strict chat templates (e.g. Qwen3 on vLLM) return
+        # when a system message appears after user/assistant turns.
+        return self._coalesce_system_messages(wire)
+
+    @staticmethod
+    def _coalesce_system_messages(
+        wire: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge all system messages into one leading system message.
+
+        Some OpenAI-compatible servers (notably vLLM serving models whose chat
+        template only permits a leading system prompt, such as Qwen3) return an
+        opaque 500 when a ``system`` message appears after user/assistant turns.
+        Amplifier legitimately injects trailing system reminders, so we relocate
+        and concatenate them into a single leading system message.
+        """
+        system_texts: list[str] = []
+        rest: list[dict[str, Any]] = []
+        for msg in wire:
+            if msg.get("role") == "system":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    if content:
+                        system_texts.append(content)
+                elif content is not None:
+                    system_texts.append(str(content))
+            else:
+                rest.append(msg)
+        if not system_texts:
+            return wire
+        merged: dict[str, Any] = {
+            "role": "system",
+            "content": "\n\n".join(system_texts),
+        }
+        return [merged, *rest]
 
     def _convert_tools_to_wire(self, tools: list[ToolSpec]) -> list[dict[str, Any]]:
         """Convert internal ToolSpec list to OpenAI function-calling wire format.
