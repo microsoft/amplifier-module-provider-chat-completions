@@ -1123,12 +1123,58 @@ class ChatCompletionsProvider:
         model if found in the server's model list.  When ``filtered=False``,
         returns all models from the server.
 
+        The query is retried with the same shared retry_with_backoff()/
+        RetryConfig machinery used by complete(), reusing this module's own
+        _translate_error() classification (retryable connection errors,
+        timeouts, 5xx; non-retryable auth/4xx).
+
+        Unlike complete(), list_models() never raises to the caller -- this
+        preserves the existing soft-failure contract (callers treat a
+        one-element fallback list as "use the configured model"). Once
+        retries are exhausted -- or immediately, for a non-retryable error
+        -- a WARNING is logged naming the attempt count and the degraded
+        fallback before falling back to the configured model, so the
+        degradation is loud in logs even though it stays silent to the
+        caller.
+
         Returns:
             A list of :class:`~amplifier_core.models.ModelInfo` objects.  On
             failure, returns a one-element list containing the configured model.
         """
+        attempt_count = 0
+
+        async def _do_list_models():
+            nonlocal attempt_count
+            attempt_count += 1
+            try:
+                return await self.client.models.list()
+            except Exception as exc:
+                raise self._translate_error(exc) from exc
+
+        async def _on_retry(attempt: int, delay: float, error: Any) -> None:
+            if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:retry",
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "delay": delay,
+                        "max_retries": self._max_retries,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
+        retry_config = RetryConfig(
+            max_retries=self._max_retries,
+            initial_delay=self._min_retry_delay,
+            max_delay=self._max_retry_delay,
+        )
+
         try:
-            response = await self.client.models.list()
+            response = await retry_with_backoff(
+                _do_list_models, config=retry_config, on_retry=_on_retry
+            )
             all_models = [
                 ModelInfo(
                     id=model.id,
@@ -1145,7 +1191,16 @@ class ChatCompletionsProvider:
                 return configured if configured else all_models[:1]
             return all_models
         except Exception as exc:
-            logger.warning("Failed to list models from server: %s", exc)
+            logger.warning(
+                "list_models() failed after %d attempt(s) (max_retries=%d): "
+                "%s. Falling back to a DEGRADED single-model list using the "
+                "configured model %r -- this can silently select the wrong "
+                "model if the server's actual catalog differs.",
+                attempt_count,
+                self._max_retries,
+                exc,
+                self._model,
+            )
             return [
                 ModelInfo(
                     id=self._model,
