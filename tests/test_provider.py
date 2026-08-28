@@ -1554,10 +1554,19 @@ class TestConfigParsing:
         return ChatCompletionsProvider(config=config or {})
 
     def test_default_base_url(self, monkeypatch):
-        """base_url defaults to 'http://localhost:8080/v1' when not set."""
+        """base_url resolves to "" when not set (no hardcoded default).
+
+        The constructor deliberately does NOT fall back to a hardcoded
+        local URL: a default here would mask missing config behind a
+        broken connection to a probably-non-existent local server (see the
+        __init__ comment). The base_url ConfigField's own `default` was
+        removed for the same reason -- it existed only for the setup
+        wizard's pre-fill and previously disagreed with this constructor
+        behavior.
+        """
         monkeypatch.delenv("CHAT_COMPLETIONS_BASE_URL", raising=False)
         provider = self._make_provider()
-        assert provider._base_url == "http://localhost:8080/v1"
+        assert provider._base_url == ""
 
     def test_custom_base_url(self, monkeypatch):
         """base_url from config overrides the default."""
