@@ -1427,10 +1427,20 @@ class ChatCompletionsProvider:
                     id="base_url",
                     display_name="Base URL",
                     field_type="text",
-                    prompt="Enter the API base URL",
+                    # No `default`: the constructor deliberately resolves a
+                    # missing base_url to "" (see __init__ above) so that the
+                    # mount() silent-skip guard and the client property's
+                    # ValueError can signal real misconfiguration. A field
+                    # default here would silently write
+                    # "http://localhost:8080/v1" into every config that left
+                    # this blank, masking that exact missing-config case
+                    # behind a broken connection to a probably-non-existent
+                    # local server. app-cli's wizard (app-cli#284) omits the
+                    # key entirely on an empty answer for None-default text
+                    # fields, so leaving this unset is safe end-to-end.
+                    prompt="Enter the API base URL (e.g. http://localhost:8080/v1)",
                     env_var="CHAT_COMPLETIONS_BASE_URL",
                     required=False,
-                    default="http://localhost:8080/v1",
                 ),
             ],
         )
