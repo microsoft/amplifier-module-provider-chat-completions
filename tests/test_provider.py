@@ -612,13 +612,20 @@ class TestGetInfo:
         assert "CHAT_COMPLETIONS_API_KEY" in info.credential_env_vars
 
     def test_has_essential_config_fields(self):
-        """The wizard-exposed config fields are the 3 essentials.
+        """The wizard-exposed config fields are the 2 essentials.
 
         `model` is intentionally NOT in config_fields: app-cli's wizard has a
         dedicated model-selection phase that calls list_models() and presents
         an interactive picker (matching the pattern in
         amplifier-module-provider-anthropic). Declaring `model` here would
         produce a duplicate free-text prompt before the picker.
+
+        `priority` is intentionally NOT in config_fields either: app-cli's
+        write path (amplifier_app_cli/commands/provider.py) unconditionally
+        computes and overwrites config["priority"] on every add/update, so a
+        wizard-entered value is always discarded. The `priority` config key
+        itself is still read normally at runtime; it's just not solicited
+        from the user.
 
         Fields previously exposed (max_tokens, temperature, timeout,
         max_retries, min_retry_delay, max_retry_delay, use_streaming,
@@ -630,7 +637,6 @@ class TestGetInfo:
         expected_field_ids = {
             "api_key",
             "base_url",
-            "priority",
         }
         provider = self._get_provider()
         info = provider.get_info()

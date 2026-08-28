@@ -1389,7 +1389,17 @@ class ChatCompletionsProvider:
                 "timeout": 300.0,
             },
             # Wizard exposes only the fields a real user has to think about
-            # the first time they add this provider: api_key, base_url, priority.
+            # the first time they add this provider: api_key, base_url.
+            #
+            # `priority` is deliberately NOT declared here. The app-cli write
+            # path (amplifier_app_cli/commands/provider.py) unconditionally
+            # computes and overwrites `config["priority"]` on every
+            # add/update, so any value entered via this field would be
+            # discarded 100% of the time — the user's answer is silently
+            # thrown away. No other provider module declares `priority` as a
+            # wizard field. The `priority` *config key* itself is still read
+            # normally (see `self._priority` above); it's just not solicited
+            # from the user through the wizard.
             #
             # `model` is deliberately NOT declared here. app-cli's wizard has a
             # dedicated "Default Model" phase (provider_config_utils.configure_provider
@@ -1421,14 +1431,6 @@ class ChatCompletionsProvider:
                     env_var="CHAT_COMPLETIONS_BASE_URL",
                     required=False,
                     default="http://localhost:8080/v1",
-                ),
-                ConfigField(
-                    id="priority",
-                    display_name="Priority",
-                    field_type="text",
-                    prompt="Provider selection priority (lower = preferred, 0 = promoted by spawn_utils)",
-                    required=False,
-                    default="100",
                 ),
             ],
         )
