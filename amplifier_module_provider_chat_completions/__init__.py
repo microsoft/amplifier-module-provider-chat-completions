@@ -5,6 +5,7 @@ making it available as the 'chat-completions' provider.
 """
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -52,6 +53,47 @@ __all__ = ["mount", "ChatCompletionsProvider", "ChatCompletionsChatResponse"]
 __amplifier_module_type__ = "provider"
 
 logger = logging.getLogger(__name__)
+
+# Config keys this provider actively reads. `priority` is read by the
+# orchestrator's provider-selection logic AND by this module itself
+# (self._priority); `extra_request_params` is app-cli-reserved. Both must
+# stay allow-listed so users are never told to delete live settings.
+_KNOWN_CONFIG_KEYS = frozenset(
+    {
+        "base_url",
+        "api_key",
+        "default_model",
+        "model",
+        "max_tokens",
+        "temperature",
+        "timeout",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "use_streaming",
+        "top_p",
+        "stop",
+        "seed",
+        "parallel_tool_calls",
+        "priority",
+        "filtered",
+        "raw",
+        "default_headers",
+        "instance_id",
+        "extra_request_params",
+    }
+)
+
+
+def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never fail) about config keys this provider doesn't recognize,
+    with a difflib did-you-mean suggestion for likely typos."""
+    for key in config:
+        if key in _KNOWN_CONFIG_KEYS:
+            continue
+        suggestions = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        hint = f" Did you mean '{suggestions[0]}'?" if suggestions else ""
+        logger.warning("[PROVIDER] Unknown config key '%s' is ignored.%s", key, hint)
 
 
 class ChatCompletionsChatResponse(ChatResponse):
@@ -121,6 +163,7 @@ class ChatCompletionsProvider:
         self.config = config or {}
         self.coordinator = coordinator
         self._add_cost = add_cost
+        _warn_unknown_config_keys(self.config)
 
         # Name: honor per-instance config so multiple chat-completions providers
         # can be mounted with distinct routing identities. Falls back to the
@@ -213,6 +256,21 @@ class ChatCompletionsProvider:
             if isinstance(_default_headers, dict)
             else None
         )
+
+        # Arbitrary OpenAI-compatible request params merged in last (after
+        # every other param is computed) -- an escape hatch for any
+        # chat.completions.create() kwarg this provider doesn't expose a
+        # dedicated field for (e.g. presence_penalty, frequency_penalty,
+        # logit_bias, response_format).
+        _extra_raw = self.config.get("extra_request_params")
+        if _extra_raw is not None and not isinstance(_extra_raw, dict):
+            logger.warning(
+                "[PROVIDER] Config key 'extra_request_params' must be a "
+                "dict; got %s. Ignoring.",
+                type(_extra_raw).__name__,
+            )
+            _extra_raw = None
+        self._extra_request_params: dict[str, Any] = _extra_raw or {}
 
     @property
     def client(self) -> openai.AsyncOpenAI:
@@ -812,6 +870,8 @@ class ChatCompletionsProvider:
             params["seed"] = self._seed
         if wire_tools and self._parallel_tool_calls is not None:
             params["parallel_tool_calls"] = self._parallel_tool_calls
+        if self._extra_request_params:
+            params.update(self._extra_request_params)
 
         response = await self.client.chat.completions.create(**params)
         return self._build_response(response), response
@@ -867,6 +927,8 @@ class ChatCompletionsProvider:
             params["seed"] = self._seed
         if wire_tools and self._parallel_tool_calls is not None:
             params["parallel_tool_calls"] = self._parallel_tool_calls
+        if self._extra_request_params:
+            params.update(self._extra_request_params)
 
         stream = await self.client.chat.completions.create(**params)
 

@@ -48,6 +48,13 @@ Tested against:
 | `priority` | int | `100` | — |
 | `filtered` | bool | `true` | — |
 | `raw` | bool | `false` | — |
+| `default_headers` | dict | `None` | Extra HTTP headers forwarded to the OpenAI client constructor on every request (e.g. a browser-like `User-Agent` to get past a WAF fronting a self-hosted endpoint) |
+| `extra_request_params` | dict | `{}` | Merged last into the `chat.completions.create()` kwargs -- an escape hatch for any param not listed above (e.g. `presence_penalty`, `frequency_penalty`, `logit_bias`, `response_format`) |
+
+Boolean and numeric keys accept native types or the string forms a config
+wizard writes (`"true"`/`"false"`, `"3"`); invalid numeric strings warn and
+fall back to the default rather than crashing at mount. Unrecognized
+config keys produce a mount-time warning (with a did-you-mean suggestion).
 
 ## Silent-skip behavior
 
