@@ -20,6 +20,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import openai
 
+from amplifier_core.content_models import ThinkingContent
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -484,8 +485,16 @@ class TestMessageConversionOutbound:
         assert result.tool_calls[0].name == "search"
         assert result.tool_calls[0].arguments == {"query": "test"}
 
-    def test_reasoning_content_becomes_thinking_block(self):
-        """reasoning_content on the message becomes a ThinkingBlock in content."""
+    def test_reasoning_content_not_persisted_as_thinking_block(self):
+        """reasoning_content on the message must NOT become a persisted ThinkingBlock.
+
+        Regression test for issue #206: signed extended thinking does not exist
+        on chat-completions APIs, so persisting a thinking-shaped block here
+        would carry signature=None -- a fabrication that Anthropic's strict
+        signature validation rejects on session resume. Reasoning must not
+        appear anywhere in the persisted `content` list, and no block anywhere
+        in the response may carry a `signature` key.
+        """
         provider = self._get_provider()
         response = _make_mock_completion(
             content="The answer is 42.",
@@ -494,13 +503,38 @@ class TestMessageConversionOutbound:
         result = provider._build_response(response)
 
         assert isinstance(result, ChatResponse)
+        # No ThinkingBlock at all in the persisted content list.
         thinking_blocks = [b for b in result.content if isinstance(b, ThinkingBlock)]
-        assert len(thinking_blocks) == 1
-        assert thinking_blocks[0].thinking == "Let me think step by step..."
-        # Text content should still be present
+        assert len(thinking_blocks) == 0
+        # No trace of the reasoning text or a signature key anywhere in content.
+        assert "Let me think step by step" not in str(result.content)
+        assert "signature" not in str(result.content)
+        # Text content should still be present and unaffected.
         text_blocks = [b for b in result.content if isinstance(b, TextBlock)]
         assert len(text_blocks) == 1
         assert text_blocks[0].text == "The answer is 42."
+
+    def test_reasoning_content_still_surfaced_for_display_via_content_blocks(self):
+        """reasoning_content is still surfaced via content_blocks (UI-only field).
+
+        content_blocks/event_blocks is never persisted into message history and
+        is never replayed back to the wire, so it remains safe to carry
+        reasoning there for live display purposes even though it is dropped
+        from the persisted `content` list.
+        """
+        provider = self._get_provider()
+        response = _make_mock_completion(
+            content="The answer is 42.",
+            reasoning_content="Let me think step by step...",
+        )
+        result = provider._build_response(response)
+
+        assert result.content_blocks is not None
+        thinking_events = [
+            b for b in result.content_blocks if isinstance(b, ThinkingContent)
+        ]
+        assert len(thinking_events) == 1
+        assert thinking_events[0].text == "Let me think step by step..."
 
 
 # ---------------------------------------------------------------------------
