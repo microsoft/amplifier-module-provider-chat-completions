@@ -81,6 +81,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "default_headers",
         "instance_id",
         "extra_request_params",
+        "close_timeout",
     }
 )
 
@@ -206,6 +207,13 @@ class ChatCompletionsProvider:
         )
         self._max_tokens: int = self._config_int(
             self.config.get("max_tokens", 4096), 4096
+        )
+        # Ceiling on how long close() will wait for the HTTP client to shut
+        # down. An httpx transport with a wedged connection can leave
+        # AsyncOpenAI.close() pending indefinitely; without a bound, that
+        # hangs session cleanup for the whole process. See close().
+        self._close_timeout: float = self._config_float(
+            self.config.get("close_timeout", 5.0), 5.0
         )
         self._max_retries: int = self._config_int(self.config.get("max_retries", 3), 3)
         self._min_retry_delay: float = self._config_float(
@@ -1473,9 +1481,9 @@ class ChatCompletionsProvider:
             #
             # All other fields (max_tokens, temperature, timeout, max_retries,
             # min_retry_delay, max_retry_delay, use_streaming,
-            # parallel_tool_calls, filtered, raw, top_p, stop, seed) keep their
-            # in-code defaults and remain overridable via settings.yaml for
-            # power users.
+            # parallel_tool_calls, filtered, raw, top_p, stop, seed,
+            # close_timeout) keep their in-code defaults and remain
+            # overridable via settings.yaml for power users.
             config_fields=[
                 ConfigField(
                     id="api_key",
@@ -1508,16 +1516,50 @@ class ChatCompletionsProvider:
         )
 
     async def close(self) -> None:
-        """Release any resources held by this provider.
+        """Release any resources held by this provider, within a time bound.
 
-        Uses asyncio.shield so the client cleanup completes even if the
-        enclosing task is cancelled.  All exceptions are suppressed.
+        ``asyncio.shield`` keeps the client cleanup running to completion
+        even if the *enclosing* task is cancelled (the original reason it
+        was here).  ``asyncio.wait_for`` puts a ceiling on how long we are
+        willing to wait for it: an httpx transport with a wedged connection
+        can leave ``AsyncOpenAI.close()`` pending forever, and an unbounded
+        await here hangs session cleanup for the whole process.  On timeout
+        we log a WARNING naming this provider instance and the abandoned
+        client, then return.  close() never raises.
+
+        ``self._client`` is cleared on every path so the ``client``
+        property's lazy-init contract still holds: that property only
+        constructs a client when ``self._client is None``, so leaving a
+        closed -- or abandoned, still-hanging -- client in place would make
+        every subsequent call reuse it.  Clearing it lets the next use
+        lazily rebuild a fresh client, and makes close() idempotent.
         """
-        if self._client is not None:
-            try:
-                await asyncio.shield(self._client.close())
-            except (asyncio.CancelledError, Exception):
-                pass
+        client = self._client
+        if client is None:
+            return
+        self._client = None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(client.close()), timeout=self._close_timeout
+            )
+        except TimeoutError:
+            logger.warning(
+                "[PROVIDER] %s: HTTP client close did not complete within "
+                "%.1fs; abandoning client %r. Its transport may leak until "
+                "the process exits. Raise 'close_timeout' in this provider's "
+                "config if a slow close is expected.",
+                self.name,
+                self._close_timeout,
+                client,
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(
+                "[PROVIDER] %s: suppressed error while closing HTTP client",
+                self.name,
+                exc_info=True,
+            )
 
 
 async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:

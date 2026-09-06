@@ -709,6 +709,89 @@ class TestClose:
 
         mock_client.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_close_is_bounded_when_client_close_never_returns(self, caplog):
+        """A client whose close() never returns must not hang cleanup.
+
+        Regression guard: close() previously awaited
+        ``asyncio.shield(self._client.close())`` with no ceiling, so a
+        wedged httpx transport hung session cleanup for the whole process.
+        """
+        import logging
+        import time
+
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={"close_timeout": 0.05})
+        assert provider._close_timeout == 0.05
+
+        release = asyncio.Event()
+
+        class _UnclosableClient:
+            async def close(self):
+                # Never returns until the test explicitly releases it.
+                await release.wait()
+
+        provider._client = _UnclosableClient()  # type: ignore[assignment]
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            await provider.close()  # must not raise, must not hang
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, f"close() took {elapsed:.2f}s; expected ~0.05s"
+        assert "did not complete within" in caplog.text
+        assert "abandoning client" in caplog.text
+        assert "chat-completions" in caplog.text
+        # Client reference dropped so the lazy-init property can rebuild.
+        assert provider._client is None
+
+        # Let the abandoned close task finish so the loop shuts down clean.
+        release.set()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_close_normal_client_logs_no_warning(self, caplog):
+        """A well-behaved client closes once, quietly, and is released."""
+        import logging
+
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={})
+        mock_client = AsyncMock()
+        provider._client = mock_client
+
+        with caplog.at_level(logging.WARNING):
+            await provider.close()
+
+        mock_client.close.assert_awaited_once()
+        assert caplog.text == ""
+        assert provider._client is None
+
+        # Idempotent: a second close() is a no-op, not a second close call.
+        await provider.close()
+        mock_client.close.assert_awaited_once()
+
+    def test_close_timeout_defaults_to_five_seconds(self):
+        """Unconfigured providers get the 5.0s default ceiling."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        assert ChatCompletionsProvider(config={})._close_timeout == 5.0
+
+    @pytest.mark.asyncio
+    async def test_close_suppresses_client_errors(self):
+        """close() never raises, even when the client's close() explodes."""
+        from amplifier_module_provider_chat_completions import ChatCompletionsProvider
+
+        provider = ChatCompletionsProvider(config={})
+        mock_client = AsyncMock()
+        mock_client.close.side_effect = RuntimeError("transport already gone")
+        provider._client = mock_client
+
+        await provider.close()
+
+        assert provider._client is None
+
 
 # ---------------------------------------------------------------------------
 # Retry tests
