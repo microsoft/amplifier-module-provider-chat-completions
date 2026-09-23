@@ -132,7 +132,7 @@ class ChatCompletionsProvider:
             return default
 
     @staticmethod
-    def _config_float(value: Any, default: float) -> float:
+    def _config_float(value: Any, default: float | None) -> float | None:
         """Parse a float config value with a safe fallback."""
         if value is None:
             return default
@@ -199,9 +199,9 @@ class ChatCompletionsProvider:
             self.config.get("default_model") or self.config.get("model") or "default"
         )
         self._client: openai.AsyncOpenAI | None = None
-        self._timeout: float = self._config_float(
-            self.config.get("timeout", 300.0), 300.0
-        )
+        # Silence while a model works is not evidence of a failed request.
+        self._timeout: float | None = self._config_float(self.config.get("timeout"), None)
+        self._sdk_timeout = openai.Timeout(self._timeout, connect=5.0, pool=5.0)
         self._temperature: float = self._config_float(
             self.config.get("temperature", 0.7), 0.7
         )
@@ -292,7 +292,7 @@ class ChatCompletionsProvider:
             self._client = openai.AsyncOpenAI(
                 base_url=self._base_url,
                 api_key=self._api_key,
-                timeout=self._timeout,
+                timeout=self._sdk_timeout,
                 default_headers=self._default_headers,
                 max_retries=0,  # Intentional: disables the openai SDK's built-in retry
                 # layer. The provider manages retries itself via
@@ -881,6 +881,7 @@ class ChatCompletionsProvider:
         if self._extra_request_params:
             params.update(self._extra_request_params)
 
+        params.setdefault("timeout", self._sdk_timeout)
         response = await self.client.chat.completions.create(**params)
         return self._build_response(response), response
 
@@ -938,6 +939,7 @@ class ChatCompletionsProvider:
         if self._extra_request_params:
             params.update(self._extra_request_params)
 
+        params.setdefault("timeout", self._sdk_timeout)
         stream = await self.client.chat.completions.create(**params)
 
         # ── Streaming event state ────────────────────────────────────────────
@@ -1456,7 +1458,7 @@ class ChatCompletionsProvider:
                 "model": self._model,
                 "max_tokens": 4096,
                 "temperature": 0.7,
-                "timeout": 300.0,
+                "timeout": None,
             },
             # Wizard exposes only the fields a real user has to think about
             # the first time they add this provider: api_key, base_url.
