@@ -183,12 +183,12 @@ class ChatCompletionsProvider:
             str(_configured_base_url) if _configured_base_url else "",
         )
 
-        # api_key: env var takes precedence over config, then "not-needed".
+        # Explicit per-instance credentials take precedence over the environment fallback.
         # Empty string is rejected by the OpenAI client library, so we use
         # "not-needed" as a safe placeholder for local/keyless deployments.
         self._api_key: str = (
-            os.environ.get("CHAT_COMPLETIONS_API_KEY")
-            or self.config.get("api_key")
+            self.config.get("api_key")
+            or os.environ.get("CHAT_COMPLETIONS_API_KEY")
             or "not-needed"
         )
 

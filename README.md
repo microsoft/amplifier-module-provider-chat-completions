@@ -51,6 +51,8 @@ Tested against:
 | `default_headers` | dict | `None` | Extra HTTP headers forwarded to the OpenAI client constructor on every request (e.g. a browser-like `User-Agent` to get past a WAF fronting a self-hosted endpoint) |
 | `extra_request_params` | dict | `{}` | Merged last into the `chat.completions.create()` kwargs -- an escape hatch for any param not listed above (e.g. `presence_penalty`, `frequency_penalty`, `logit_bias`, `response_format`) |
 
+An explicit `config.api_key` takes precedence over `CHAT_COMPLETIONS_API_KEY`. If it is missing or empty, the environment variable is used; if both are absent, the provider sends `not-needed` for local endpoints.
+
 Boolean and numeric keys accept native types or the string forms a config
 wizard writes (`"true"`/`"false"`, `"3"`); invalid numeric strings warn and
 fall back to the default rather than crashing at mount. Unrecognized
