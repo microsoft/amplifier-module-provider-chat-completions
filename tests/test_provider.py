@@ -484,8 +484,17 @@ class TestMessageConversionOutbound:
         assert result.tool_calls[0].name == "search"
         assert result.tool_calls[0].arguments == {"query": "test"}
 
-    def test_reasoning_content_becomes_thinking_block(self):
-        """reasoning_content on the message becomes a ThinkingBlock in content."""
+    def test_reasoning_content_does_not_become_thinking_block(self):
+        """reasoning_content must NOT be persisted as a ThinkingBlock.
+
+        OpenAI-compatible chat-completions APIs have no signed extended
+        thinking, so a fabricated ThinkingBlock would carry signature=None.
+        Replaying such history to provider-anthropic 400s the entire request
+        (see microsoft-amplifier/amplifier-support#206). reasoning_content is
+        still surfaced live via the ephemeral ThinkingContent event block
+        (render-only, never replayed) -- only the persisted content list must
+        stay free of ThinkingBlock.
+        """
         provider = self._get_provider()
         response = _make_mock_completion(
             content="The answer is 42.",
@@ -495,9 +504,8 @@ class TestMessageConversionOutbound:
 
         assert isinstance(result, ChatResponse)
         thinking_blocks = [b for b in result.content if isinstance(b, ThinkingBlock)]
-        assert len(thinking_blocks) == 1
-        assert thinking_blocks[0].thinking == "Let me think step by step..."
-        # Text content should still be present
+        assert len(thinking_blocks) == 0
+        # Text content must still survive.
         text_blocks = [b for b in result.content if isinstance(b, TextBlock)]
         assert len(text_blocks) == 1
         assert text_blocks[0].text == "The answer is 42."

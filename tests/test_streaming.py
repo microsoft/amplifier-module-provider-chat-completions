@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from amplifier_core.message_models import ChatRequest, Message
+from amplifier_core.message_models import ChatRequest, Message, TextBlock, ThinkingBlock
 
 from amplifier_module_provider_chat_completions import ChatCompletionsProvider
 
@@ -349,6 +349,43 @@ async def test_thinking_block_delta_carries_block_type_and_text():
     assert len(thinking_deltas) == 1
     assert thinking_deltas[0]["text"] == "some reasoning"
     assert thinking_deltas[0]["block_type"] == "thinking"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_content_does_not_become_persisted_thinking_block():
+    """The persisted ChatResponse.content must never contain a ThinkingBlock.
+
+    reasoning_content deltas still drive the ephemeral llm:stream_block_delta /
+    llm:stream_block_end UI events above (render-only, never replayed to a
+    provider) -- but the persisted content returned from complete() must be
+    free of ThinkingBlock, since chat-completions has no signed extended
+    thinking and a fabricated block would carry signature=None. Replaying
+    that history to provider-anthropic 400s the whole request (see
+    microsoft-amplifier/amplifier-support#206).
+    """
+    provider = _make_provider()
+    chunks = [
+        _make_mock_chunk(reasoning_content="step1"),
+        _make_mock_chunk(content="answer"),
+        _make_mock_chunk(finish_reason="stop"),
+    ]
+    _set_fake_stream(provider, chunks)
+
+    resp = await provider.complete(_simple_request())
+
+    assert not any(isinstance(b, ThinkingBlock) for b in resp.content)
+    text_blocks = [b for b in resp.content if isinstance(b, TextBlock)]
+    assert len(text_blocks) == 1
+    assert text_blocks[0].text == "answer"
+
+    # The ephemeral UI stream is untouched: thinking deltas still fired.
+    hooks = provider.coordinator.hooks
+    thinking_deltas = [
+        d
+        for d in hooks.payloads_for("llm:stream_block_delta")
+        if d.get("block_type") == "thinking"
+    ]
+    assert thinking_deltas, "Expected ephemeral thinking block_delta to still fire"
 
 
 # ---------------------------------------------------------------------------
