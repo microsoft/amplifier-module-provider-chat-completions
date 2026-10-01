@@ -36,7 +36,7 @@ Tested against:
 | `default_model` / `model` | text | `default` | — |
 | `max_tokens` | int | `4096` | — |
 | `temperature` | float | `0.7` | — |
-| `timeout` | float | `300.0` | — |
+| `timeout` | float or null | `null` | Optional request deadline, seconds |
 | `max_retries` | int | `3` | — |
 | `min_retry_delay` | float | `1.0` | — |
 | `max_retry_delay` | float | `30.0` | — |
@@ -122,3 +122,6 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+### Waiting for model work
+
+Completion and streaming requests have no elapsed-time or read-idle deadline by default. They wait for completion, explicit cancellation, or a provider/transport error. Set `timeout` (seconds) to opt into a request deadline; `null` leaves model work unbounded. Connection and pool acquisition remain bounded to 5 seconds, and existing `close_timeout` cleanup limits are unchanged.

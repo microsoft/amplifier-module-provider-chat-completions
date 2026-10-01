@@ -1699,9 +1699,9 @@ class TestConfigParsing:
         assert provider._temperature == 0.7
 
     def test_default_timeout(self):
-        """timeout defaults to 300.0."""
+        """Model work is unbounded unless the caller requests a deadline."""
         provider = self._make_provider()
-        assert provider._timeout == 300.0
+        assert provider._timeout is None
 
     def test_use_streaming_default_true(self):
         """use_streaming defaults to True when not set."""
