@@ -1663,11 +1663,11 @@ class TestConfigParsing:
         provider = self._make_provider(config={"base_url": "http://config-server/v1"})
         assert provider._base_url == "http://env-server:1234/v1"
 
-    def test_api_key_from_env(self, monkeypatch):
-        """CHAT_COMPLETIONS_API_KEY env var overrides config api_key."""
+    def test_explicit_api_key_overrides_environment(self, monkeypatch):
+        """An instance-specific API key takes precedence over ambient defaults."""
         monkeypatch.setenv("CHAT_COMPLETIONS_API_KEY", "env-secret-key")
         provider = self._make_provider(config={"api_key": "config-key"})
-        assert provider._api_key == "env-secret-key"
+        assert provider._api_key == "config-key"
 
     def test_empty_api_key_default(self):
         """api_key defaults to 'not-needed' when not set in config or env.
@@ -2256,3 +2256,20 @@ class TestMountCostCallback:
         beta_result = beta_fn()
         assert beta_result is not None
         assert beta_result.get("cost_usd") == str(Decimal("0.00027"))
+
+
+@pytest.mark.parametrize("configured,ambient,expected", [
+    ("account-one", "ambient-account", "account-one"),
+    (None, "ambient-account", "ambient-account"),
+    ("", "ambient-account", "ambient-account"),
+    (None, None, "not-needed"),
+])
+def test_explicit_credentials_precede_environment(monkeypatch, configured, ambient, expected):
+    monkeypatch.delenv("CHAT_COMPLETIONS_API_KEY", raising=False)
+    if ambient: monkeypatch.setenv("CHAT_COMPLETIONS_API_KEY", ambient)
+    provider = module.ChatCompletionsProvider(config={"api_key": configured})
+    assert provider._api_key == expected
+    # Constructing another account must not rewrite process-wide credentials.
+    other = module.ChatCompletionsProvider(config={"api_key": "account-two"})
+    assert other._api_key == "account-two"
+    assert provider._api_key == expected
