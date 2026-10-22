@@ -378,6 +378,57 @@ class TestMessageConversionInbound:
             "content": "42",
         }
 
+    def test_string_tool_result_preserves_id_and_input(self):
+        from copy import deepcopy
+
+        messages = [Message(role="tool", tool_call_id="call_1", content="observed")]
+        before = deepcopy(messages)
+        assert self._get_provider()._convert_messages_to_wire(messages) == [
+            {"role": "tool", "tool_call_id": "call_1", "content": "observed"}
+        ]
+        assert messages == before
+
+    def test_each_result_block_becomes_a_correlated_tool_message(self):
+        from copy import deepcopy
+
+        messages = [
+            Message(
+                role="tool",
+                content=[
+                    ToolResultBlock(tool_call_id="a", output="RECEIPT_A"),
+                    ToolResultBlock(tool_call_id="b", output="RECEIPT_B"),
+                ],
+            )
+        ]
+        before = deepcopy(messages)
+        assert self._get_provider()._convert_messages_to_wire(messages) == [
+            {"role": "tool", "tool_call_id": "a", "content": "RECEIPT_A"},
+            {"role": "tool", "tool_call_id": "b", "content": "RECEIPT_B"},
+        ]
+        assert messages == before
+
+    @pytest.mark.parametrize(
+        "content", ["unbound", [ToolResultBlock(tool_call_id="", output="unbound")]]
+    )
+    def test_uncorrelated_tool_result_is_rejected(self, content):
+        with pytest.raises(ValueError, match="requires tool_call_id"):
+            self._get_provider()._convert_messages_to_wire(
+                [Message(role="tool", content=content)]
+            )
+
+    def test_mixed_result_content_is_rejected_not_discarded(self):
+        messages = [
+            Message(
+                role="tool",
+                content=[
+                    TextBlock(text="must not disappear"),
+                    ToolResultBlock(tool_call_id="a", output="observed"),
+                ],
+            )
+        ]
+        with pytest.raises(ValueError, match="cannot be mixed"):
+            self._get_provider()._convert_messages_to_wire(messages)
+
     def test_developer_role_becomes_user_with_context_file(self):
         """'developer' role is wrapped in <context_file> XML and mapped to 'user'."""
         provider = self._get_provider()
@@ -2189,7 +2240,10 @@ class TestMountCostCallback:
             "so the guard in _build_response() never fired."
         )
         expected = Decimal("0.00027")
-        assert compute_cost("gpt-4o-mini", prompt_tokens=1_000, completion_tokens=200) == expected, (
+        assert (
+            compute_cost("gpt-4o-mini", prompt_tokens=1_000, completion_tokens=200)
+            == expected
+        ), (
             "Pricing sanity check: _cost.py rates appear to have changed; "
             "update expected= in this test to match the new rate"
         )
@@ -2203,7 +2257,6 @@ class TestMountCostCallback:
         to report a cost. Each provider's _add_cost closure captures its own
         _totals dict.
         """
-        from amplifier_module_provider_chat_completions._cost import compute_cost
         import amplifier_module_provider_chat_completions as module
 
         coordinator = self._make_coordinator()
@@ -2258,15 +2311,21 @@ class TestMountCostCallback:
         assert beta_result.get("cost_usd") == str(Decimal("0.00027"))
 
 
-@pytest.mark.parametrize("configured,ambient,expected", [
-    ("account-one", "ambient-account", "account-one"),
-    (None, "ambient-account", "ambient-account"),
-    ("", "ambient-account", "ambient-account"),
-    (None, None, "not-needed"),
-])
-def test_explicit_credentials_precede_environment(monkeypatch, configured, ambient, expected):
+@pytest.mark.parametrize(
+    "configured,ambient,expected",
+    [
+        ("account-one", "ambient-account", "account-one"),
+        (None, "ambient-account", "ambient-account"),
+        ("", "ambient-account", "ambient-account"),
+        (None, None, "not-needed"),
+    ],
+)
+def test_explicit_credentials_precede_environment(
+    monkeypatch, configured, ambient, expected
+):
     monkeypatch.delenv("CHAT_COMPLETIONS_API_KEY", raising=False)
-    if ambient: monkeypatch.setenv("CHAT_COMPLETIONS_API_KEY", ambient)
+    if ambient:
+        monkeypatch.setenv("CHAT_COMPLETIONS_API_KEY", ambient)
     provider = module.ChatCompletionsProvider(config={"api_key": configured})
     assert provider._api_key == expected
     # Constructing another account must not rewrite process-wide credentials.

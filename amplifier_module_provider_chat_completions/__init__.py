@@ -200,7 +200,9 @@ class ChatCompletionsProvider:
         )
         self._client: openai.AsyncOpenAI | None = None
         # Silence while a model works is not evidence of a failed request.
-        self._timeout: float | None = self._config_float(self.config.get("timeout"), None)
+        self._timeout: float | None = self._config_float(
+            self.config.get("timeout"), None
+        )
         self._sdk_timeout = openai.Timeout(self._timeout, connect=5.0, pool=5.0)
         self._temperature: float = self._config_float(
             self.config.get("temperature", 0.7), 0.7
@@ -621,14 +623,19 @@ class ChatCompletionsProvider:
             content = message.content
 
             if isinstance(content, str):
-                wire.append({"role": role, "content": content})
+                msg = {"role": role, "content": content}
+                if role == "tool":
+                    if not message.tool_call_id:
+                        raise ValueError("A string tool result requires tool_call_id")
+                    msg["tool_call_id"] = message.tool_call_id
+                wire.append(msg)
                 continue
 
             # List of content blocks — iterate and classify.
             text_parts: list[str] = []
             tool_calls_wire: list[dict[str, Any]] = []
             image_parts: list[dict[str, Any]] = []
-            tool_result_block: ToolResultBlock | None = None
+            tool_result_blocks: list[ToolResultBlock] = []
 
             for block in content:
                 if isinstance(block, TextBlock):
@@ -647,21 +654,29 @@ class ChatCompletionsProvider:
                         }
                     )
                 elif isinstance(block, ToolResultBlock):
-                    tool_result_block = block
+                    tool_result_blocks.append(block)
                 elif isinstance(block, ImageBlock):
                     src = block.source
                     url = f"data:{src['media_type']};base64,{src['data']}"
                     image_parts.append({"type": "image_url", "image_url": {"url": url}})
 
-            if tool_result_block is not None:
-                # ToolResultBlock overrides everything else in this message.
-                wire.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_result_block.tool_call_id,
-                        "content": str(tool_result_block.output),
-                    }
-                )
+            if tool_result_blocks:
+                # Chat Completions needs one correlated tool message per result.
+                # Mixed content cannot be silently overridden by a result block.
+                if any(not isinstance(block, ToolResultBlock) for block in content):
+                    raise ValueError(
+                        "Tool results cannot be mixed with other content blocks"
+                    )
+                for block in tool_result_blocks:
+                    if not block.tool_call_id:
+                        raise ValueError("A tool result requires tool_call_id")
+                    wire.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block.tool_call_id,
+                            "content": str(block.output),
+                        }
+                    )
                 continue
 
             msg: dict[str, Any] = {"role": role}

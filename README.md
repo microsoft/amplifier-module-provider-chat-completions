@@ -27,6 +27,11 @@ Tested against:
 - JIT tool-sequence repair for local models that emit non-compliant conversation history
 - Per-instance naming so multiple chat-completions providers can be mounted in the same session with distinct routing identities
 
+Tool results retain their `tool_call_id`. A message with several result blocks
+produces one wire tool message per result, in block order. An uncorrelated result
+or a mixture of result and other content blocks is rejected before dispatch,
+rather than silently discarding evidence.
+
 ## Configuration
 
 | Key | Type | Default | Env Var |
