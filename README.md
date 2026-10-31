@@ -130,3 +130,10 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 ### Waiting for model work
 
 Completion and streaming requests have no elapsed-time or read-idle deadline by default. They wait for completion, explicit cancellation, or a provider/transport error. Set `timeout` (seconds) to opt into a request deadline; `null` leaves model work unbounded. Connection and pool acquisition remain bounded to 5 seconds, and existing `close_timeout` cleanup limits are unchanged.
+
+### Cache usage reporting
+
+Both response modes preserve `prompt_tokens_details.cached_tokens` when reported,
+including zero. Missing cache usage remains unknown. Cost calculation continues
+to use the existing rates; the provider does not infer cache hits or enable
+vendor-specific cache controls on arbitrary compatible endpoints.

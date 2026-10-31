@@ -825,13 +825,13 @@ class ChatCompletionsProvider:
             usage_obj = response.usage
             prompt_tokens = usage_obj.prompt_tokens
             completion_tokens = usage_obj.completion_tokens
-            cached = 0
+            cached = None
             if (
                 hasattr(usage_obj, "prompt_tokens_details")
                 and usage_obj.prompt_tokens_details
             ):
                 cached = (
-                    getattr(usage_obj.prompt_tokens_details, "cached_tokens", 0) or 0
+                    getattr(usage_obj.prompt_tokens_details, "cached_tokens", None)
                 )
             usage = Usage(
                 input_tokens=prompt_tokens,
@@ -839,13 +839,13 @@ class ChatCompletionsProvider:
                 total_tokens=getattr(
                     usage_obj, "total_tokens", prompt_tokens + completion_tokens
                 ),
-                cache_read_tokens=cached or None,
+                cache_read_tokens=cached,
             )
             _cost = compute_cost(
                 response.model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                cached_tokens=cached,
+                cached_tokens=cached or 0,
             )
             if _cost is not None:
                 usage = usage.model_copy(update={"cost_usd": _cost})
@@ -1173,20 +1173,20 @@ class ChatCompletionsProvider:
         if usage is not None:
             s_prompt = getattr(usage, "prompt_tokens", 0)
             s_completion = getattr(usage, "completion_tokens", 0)
-            s_cached = 0
+            s_cached = None
             if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
-                s_cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                s_cached = getattr(usage.prompt_tokens_details, "cached_tokens", None)
             usage_obj = Usage(
                 input_tokens=s_prompt,
                 output_tokens=s_completion,
                 total_tokens=getattr(usage, "total_tokens", s_prompt + s_completion),
-                cache_read_tokens=s_cached or None,
+                cache_read_tokens=s_cached,
             )
             _s_cost = compute_cost(
                 model,
                 prompt_tokens=s_prompt,
                 completion_tokens=s_completion,
-                cached_tokens=s_cached,
+                cached_tokens=s_cached or 0,
             )
             if _s_cost is not None:
                 usage_obj = usage_obj.model_copy(update={"cost_usd": _s_cost})
