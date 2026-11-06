@@ -1459,12 +1459,14 @@ class TestObservabilityEvents:
 
 
 class TestListModels:
-    """Tests for list_models(): dynamic model listing with graceful fallback."""
+    """Tests for canonical dynamic model listing."""
 
     def _make_provider(self, model: str = "test-model"):
         from amplifier_module_provider_chat_completions import ChatCompletionsProvider
 
-        return ChatCompletionsProvider(config={"model": model, "max_tokens": "4096"})
+        return ChatCompletionsProvider(
+            config={"model": model, "max_tokens": "4096", "max_retries": 0}
+        )
 
     @pytest.mark.asyncio
     async def test_returns_models_from_server(self):
@@ -1480,6 +1482,7 @@ class TestListModels:
         # Mock page with .data list
         mock_page = MagicMock()
         mock_page.data = [mock_model]
+        mock_page.has_next_page.return_value = False
 
         mock_client = MagicMock()
         mock_client.models.list = AsyncMock(return_value=mock_page)
@@ -1492,9 +1495,9 @@ class TestListModels:
         assert all(isinstance(m, ModelInfo) for m in result)
 
     @pytest.mark.asyncio
-    async def test_returns_fallback_on_failure(self):
-        """list_models() returns fallback with configured model id on any exception."""
-        from amplifier_core.models import ModelInfo
+    async def test_raises_on_failure(self):
+        """Failed discovery must not turn a configured selection into inventory."""
+        from amplifier_core.llm_errors import LLMError
 
         provider = self._make_provider(model="my-configured-model")
 
@@ -1502,11 +1505,8 @@ class TestListModels:
         mock_client.models.list = AsyncMock(side_effect=Exception("Connection failed"))
         provider._client = mock_client
 
-        result = await provider.list_models()
-
-        assert len(result) == 1
-        assert isinstance(result[0], ModelInfo)
-        assert result[0].id == "my-configured-model"
+        with pytest.raises(LLMError):
+            await provider.list_models()
 
     @pytest.mark.asyncio
     async def test_filtered_true_returns_only_configured_model(self):
@@ -1523,6 +1523,7 @@ class TestListModels:
         mock_model_2.id = "gemma26-short"
         mock_page = MagicMock()
         mock_page.data = [mock_model_1, mock_model_2]
+        mock_page.has_next_page.return_value = False
 
         mock_client = MagicMock()
         mock_client.models.list = AsyncMock(return_value=mock_page)
@@ -1548,6 +1549,7 @@ class TestListModels:
         mock_model_2.id = "gemma26-short"
         mock_page = MagicMock()
         mock_page.data = [mock_model_1, mock_model_2]
+        mock_page.has_next_page.return_value = False
 
         mock_client = MagicMock()
         mock_client.models.list = AsyncMock(return_value=mock_page)

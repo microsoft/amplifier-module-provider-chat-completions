@@ -1,4 +1,4 @@
-"""Strict discovery uses current endpoint evidence, never legacy fallbacks."""
+"""Canonical listing uses current endpoint evidence, never fabricated fallbacks."""
 
 import json
 from types import SimpleNamespace
@@ -43,11 +43,9 @@ def wire_models(*ids):
 
 
 def model_ids(result):
-    assert result["version"] == 1
-    assert result["source"] == "provider-api"
     # Existing public ModelInfo serialization must remain JSON-compatible.
-    json.dumps({**result, "models": [m.model_dump(mode="json") for m in result["models"]]})
-    return [m.id for m in result["models"]]
+    json.dumps([m.model_dump(mode="json") for m in result])
+    return [m.id for m in result]
 
 
 @pytest.mark.asyncio
@@ -69,12 +67,11 @@ async def test_current_endpoint_ids_ignore_selection_and_refresh_every_call(monk
         default_model="another-configured-default",
         reasoning_effort="high",
         priority=7,
-        filtered=True,
     )
     try:
-        assert model_ids(await provider.discover_models()) == ["account-a", "account-b"]
-        assert model_ids(await provider.discover_models()) == []
-        assert model_ids(await provider.discover_models()) == ["account-c"]
+        assert model_ids(await provider.list_models()) == ["account-a", "account-b"]
+        assert model_ids(await provider.list_models()) == []
+        assert model_ids(await provider.list_models()) == ["account-c"]
         assert len(requests) == 3
         for request in requests:
             assert str(request.url) == "https://endpoint.invalid/custom/v1/models"
@@ -94,9 +91,7 @@ async def test_http_failure_raises_despite_legacy_configured_fallback(status, er
     )
     try:
         with pytest.raises(error_type):
-            await provider.discover_models()
-        # The older independent client contract still deliberately falls back.
-        assert [m.id for m in await provider.list_models()] == ["configured-not-in-api"]
+            await provider.list_models()
     finally:
         await provider.close()
 
@@ -115,7 +110,7 @@ async def test_transport_failure_raises_not_an_inventory(error_type):
             else ProviderUnavailableError
         )
         with pytest.raises(expected):
-            await provider.discover_models()
+            await provider.list_models()
     finally:
         await provider.close()
 
@@ -136,7 +131,7 @@ async def test_malformed_response_never_becomes_empty_or_configured_rows(payload
     provider = provider_for(lambda request: httpx.Response(200, json=payload))
     try:
         with pytest.raises(LLMError):
-            await provider.discover_models()
+            await provider.list_models()
     finally:
         await provider.close()
 
@@ -146,7 +141,7 @@ async def test_malformed_json_raises():
     provider = provider_for(lambda request: httpx.Response(200, text="not-json"))
     try:
         with pytest.raises(LLMError):
-            await provider.discover_models()
+            await provider.list_models()
     finally:
         await provider.close()
 
@@ -154,11 +149,12 @@ async def test_malformed_json_raises():
 @pytest.mark.asyncio
 async def test_legacy_filtered_first_model_contract_remains():
     provider = provider_for(
-        lambda request: httpx.Response(200, json=wire_models("first", "second"))
+        lambda request: httpx.Response(200, json=wire_models("first", "second")),
+        filtered=True,
     )
     try:
         assert [m.id for m in await provider.list_models()] == ["first"]
-        assert model_ids(await provider.discover_models()) == ["first", "second"]
+        assert model_ids(await provider.list_models(filters={})) == ["first", "second"]
     finally:
         await provider.close()
 
@@ -177,12 +173,12 @@ async def test_pagination_includes_all_ids_and_propagates_later_page_failure():
     provider._client = SimpleNamespace(
         models=SimpleNamespace(list=AsyncMock(return_value=first))
     )
-    assert model_ids(await provider.discover_models()) == ["first", "second"]
+    assert model_ids(await provider.list_models()) == ["first", "second"]
     first.get_next_page.side_effect = openai.APIConnectionError(
         request=httpx.Request("GET", "https://endpoint.invalid/models")
     )
     with pytest.raises(ProviderUnavailableError):
-        await provider.discover_models()
+        await provider.list_models()
 
 
 @pytest.mark.asyncio
@@ -198,5 +194,5 @@ async def test_retry_uses_existing_classification_without_fallback(monkeypatch):
     )
     provider._client = SimpleNamespace(models=SimpleNamespace(list=call))
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
-    assert model_ids(await provider.discover_models()) == ["actual"]
+    assert model_ids(await provider.list_models()) == ["actual"]
     assert call.await_count == 2
