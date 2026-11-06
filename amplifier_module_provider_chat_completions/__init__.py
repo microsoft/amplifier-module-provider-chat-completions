@@ -1203,6 +1203,51 @@ class ChatCompletionsProvider:
         )
         return chat_response, None
 
+    def _model_info(self, model_id: str) -> ModelInfo:
+        """Annotate an endpoint-supplied model ID."""
+        return ModelInfo(
+            id=model_id,
+            display_name=model_id,
+            context_window=0,
+            max_output_tokens=self._max_tokens,
+            capabilities=["tools", "streaming"],
+        )
+
+    async def discover_models(self) -> dict[str, Any]:
+        """Fetch the current endpoint inventory without selection or fallbacks.
+
+        This optional strict seam is separate from ``list_models``' legacy
+        soft-failure contract. Each call queries the configured client afresh;
+        successful empty responses stay empty and errors remain typed errors.
+        """
+
+        async def _fetch() -> list[ModelInfo]:
+            try:
+                page = await self.client.models.list()
+                models: list[ModelInfo] = []
+                while True:
+                    if not isinstance(page.data, list):
+                        raise ValueError("Model discovery response requires a data list")
+                    for model in page.data:
+                        if not isinstance(model.id, str) or not model.id.strip():
+                            raise ValueError("Model discovery requires non-empty string IDs")
+                        models.append(self._model_info(model.id))
+                    if not hasattr(page, "has_next_page") or not page.has_next_page():
+                        return models
+                    page = await page.get_next_page()
+            except Exception as exc:
+                raise self._translate_error(exc) from exc
+
+        models = await retry_with_backoff(
+            _fetch,
+            config=RetryConfig(
+                max_retries=self._max_retries,
+                initial_delay=self._min_retry_delay,
+                max_delay=self._max_retry_delay,
+            ),
+        )
+        return {"version": 1, "source": "provider-api", "models": models}
+
     async def list_models(self) -> list[ModelInfo]:
         """Return a list of models available on the server.
 
@@ -1262,16 +1307,7 @@ class ChatCompletionsProvider:
             response = await retry_with_backoff(
                 _do_list_models, config=retry_config, on_retry=_on_retry
             )
-            all_models = [
-                ModelInfo(
-                    id=model.id,
-                    display_name=model.id,
-                    context_window=0,
-                    max_output_tokens=self._max_tokens,
-                    capabilities=["tools", "streaming"],
-                )
-                for model in response.data
-            ]
+            all_models = [self._model_info(model.id) for model in response.data]
             # Task 7: filtered mode — return only configured model when filtered=True
             if self._filtered and self._model and self._model != "default":
                 configured = [m for m in all_models if m.id == self._model]
