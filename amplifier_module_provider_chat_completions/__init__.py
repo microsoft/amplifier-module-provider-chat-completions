@@ -12,12 +12,14 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
 import openai
 
 from ._cost import compute_cost
+from ._model_listing import ModelFilters, selector_schema
 
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
@@ -77,6 +79,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "parallel_tool_calls",
         "priority",
         "filtered",
+        "model_filters",
         "raw",
         "default_headers",
         "instance_id",
@@ -246,8 +249,18 @@ class ChatCompletionsProvider:
         # Task 6: priority
         self._priority: int = self._config_int(self.config.get("priority", 100), 100)
 
-        # Task 7: filtered
-        self._filtered: bool = self._config_bool(self.config.get("filtered", True))
+        # All actual endpoint IDs by default. Preserve explicitly configured legacy
+        # filtering, but canonical configuration and per-call mappings replace it.
+        self._filtered: bool = self._config_bool(self.config.get("filtered", False))
+        self._model_filters = ModelFilters.parse(
+            self.config["model_filters"]
+            if "model_filters" in self.config
+            else (
+                {"legacy_filtered_model": self._model}
+                if self._filtered and self._model != "default"
+                else {}
+            )
+        )
 
         # Task 8: raw
         self._raw: bool = self._config_bool(self.config.get("raw", False))
@@ -1203,99 +1216,87 @@ class ChatCompletionsProvider:
         )
         return chat_response, None
 
-    async def list_models(self) -> list[ModelInfo]:
-        """Return a list of models available on the server.
-
-        When ``filtered=True`` (the default), returns only the configured
-        model if found in the server's model list.  When ``filtered=False``,
-        returns all models from the server.
-
-        The query is retried with the same shared retry_with_backoff()/
-        RetryConfig machinery used by complete(), reusing this module's own
-        _translate_error() classification (retryable connection errors,
-        timeouts, 5xx; non-retryable auth/4xx).
-
-        Unlike complete(), list_models() never raises to the caller -- this
-        preserves the existing soft-failure contract (callers treat a
-        one-element fallback list as "use the configured model"). Once
-        retries are exhausted -- or immediately, for a non-retryable error
-        -- a WARNING is logged naming the attempt count and the degraded
-        fallback before falling back to the configured model, so the
-        degradation is loud in logs even though it stays silent to the
-        caller.
-
-        Returns:
-            A list of :class:`~amplifier_core.models.ModelInfo` objects.  On
-            failure, returns a one-element list containing the configured model.
-        """
-        attempt_count = 0
-
-        async def _do_list_models():
-            nonlocal attempt_count
-            attempt_count += 1
-            try:
-                return await self.client.models.list()
-            except Exception as exc:
-                raise self._translate_error(exc) from exc
-
-        async def _on_retry(attempt: int, delay: float, error: Any) -> None:
-            if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "provider:retry",
-                    {
-                        "provider": self.name,
-                        "attempt": attempt,
-                        "delay": delay,
-                        "max_retries": self._max_retries,
-                        "error_type": type(error).__name__,
-                        "error_message": str(error),
-                    },
-                )
-
-        retry_config = RetryConfig(
-            max_retries=self._max_retries,
-            initial_delay=self._min_retry_delay,
-            max_delay=self._max_retry_delay,
+    def _model_info(self, model_id: str) -> ModelInfo:
+        """Annotate an endpoint-supplied model ID."""
+        return ModelInfo(
+            id=model_id,
+            display_name=model_id,
+            context_window=0,
+            max_output_tokens=0,
+            capabilities=[],
         )
 
-        try:
-            response = await retry_with_backoff(
-                _do_list_models, config=retry_config, on_retry=_on_retry
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Describe listing policy without contacting the endpoint."""
+        return {
+            "version": 1,
+            "source": "provider-api",
+            "filters_keyword": "filters",
+            "filters_schema": selector_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {},
+            "override": "replace",
+        }
+
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """Fetch the current bound endpoint catalog, with no fabricated fallback.
+
+        None uses immutable configured defaults; a mapping replaces them and {}
+        is unfiltered. Filters affect recommendations, never explicit inference.
+        Empty success and typed failure remain distinct; all pages are consumed.
+        """
+        policy = self._model_filters if filters is None else ModelFilters.parse(filters)
+
+        async def _fetch() -> list[ModelInfo]:
+            try:
+                page = await self.client.models.list()
+                models: list[ModelInfo] = []
+                while True:
+                    if not isinstance(page.data, list):
+                        raise ValueError("Model discovery response requires a data list")
+                    for model in page.data:
+                        if not isinstance(model.id, str) or not model.id.strip():
+                            raise ValueError("Model discovery requires non-empty string IDs")
+                        models.append(self._model_info(model.id))
+                    if not hasattr(page, "has_next_page") or not page.has_next_page():
+                        return models
+                    page = await page.get_next_page()
+            except Exception as exc:
+                translated = self._translate_error(exc)
+                # SDK error bodies can contain credentials or endpoint details.
+                raise type(translated)(
+                    "Endpoint model listing failed",
+                    provider=self.name,
+                    retryable=translated.retryable,
+                    status_code=getattr(translated, "status_code", None),
+                ) from None
+
+        async def _on_retry(attempt: int, delay: float, error: Any) -> None:
+            await self._emit_event(
+                "provider:retry",
+                {
+                    "provider": self.name,
+                    "attempt": attempt,
+                    "delay": delay,
+                    "max_retries": self._max_retries,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                },
             )
-            all_models = [
-                ModelInfo(
-                    id=model.id,
-                    display_name=model.id,
-                    context_window=0,
-                    max_output_tokens=self._max_tokens,
-                    capabilities=["tools", "streaming"],
-                )
-                for model in response.data
-            ]
-            # Task 7: filtered mode — return only configured model when filtered=True
-            if self._filtered and self._model and self._model != "default":
-                configured = [m for m in all_models if m.id == self._model]
-                return configured if configured else all_models[:1]
-            return all_models
-        except Exception as exc:
-            logger.warning(
-                "list_models() failed after %d attempt(s) (max_retries=%d): "
-                "%s. Falling back to a DEGRADED single-model list using the "
-                "configured model %r -- this can silently select the wrong "
-                "model if the server's actual catalog differs.",
-                attempt_count,
-                self._max_retries,
-                exc,
-                self._model,
-            )
-            return [
-                ModelInfo(
-                    id=self._model,
-                    display_name=self._model,
-                    context_window=0,
-                    max_output_tokens=self._max_tokens,
-                )
-            ]
+
+        models = await retry_with_backoff(
+            _fetch,
+            config=RetryConfig(
+                max_retries=self._max_retries,
+                initial_delay=self._min_retry_delay,
+                max_delay=self._max_retry_delay,
+            ),
+            on_retry=_on_retry,
+        )
+        selected = set(policy.select([model.id for model in models]))
+        return [self._model_info(model_id) for model_id in sorted(selected)]
 
     async def complete(
         self, request: ChatRequest, **kwargs: Any

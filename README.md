@@ -51,7 +51,8 @@ rather than silently discarding evidence.
 | `seed` | int | `None` | — |
 | `parallel_tool_calls` | bool | `true` | — |
 | `priority` | int | `100` | — |
-| `filtered` | bool | `true` | — |
+| `filtered` | bool | `false` | Deprecated explicit configured-model filter; `model_filters` takes precedence |
+| `model_filters` | mapping | `{}` (all endpoint IDs) | — |
 | `raw` | bool | `false` | — |
 | `default_headers` | dict | `None` | Extra HTTP headers forwarded to the OpenAI client constructor on every request (e.g. a browser-like `User-Agent` to get past a WAF fronting a self-hosted endpoint) |
 | `extra_request_params` | dict | `{}` | Merged last into the `chat.completions.create()` kwargs -- an escape hatch for any param not listed above (e.g. `presence_penalty`, `frequency_penalty`, `logit_bias`, `response_format`) |
@@ -62,6 +63,30 @@ Boolean and numeric keys accept native types or the string forms a config
 wizard writes (`"true"`/`"false"`, `"3"`); invalid numeric strings warn and
 fall back to the default rather than crashing at mount. Unrecognized
 config keys produce a mount-time warning (with a did-you-mean suggestion).
+
+## Model listing
+
+`await provider.list_models()` returns all current endpoint IDs by default, including
+custom aliases and tagged/quantized models. `filters=None` uses a validated immutable
+snapshot of `config.model_filters`; any explicit mapping replaces that policy:
+`filters={}` is unfiltered, `{"include": []}` includes none, and `exclude` wins.
+`include`/`exclude` use case-insensitive, OS-independent glob matching without
+changing returned IDs. Optional `hide_dated` suppresses a YYYY-MM-DD snapshot only
+when its undated alias is selected. No vendor prefix is assumed.
+
+An explicit legacy `filtered=true` still selects the configured ID, or the first
+endpoint row if absent. Its `legacy_filtered_model` policy appears in
+`get_model_list_info().default_filters`; canonical config and call overrides replace
+it entirely. This legacy behavior is not the new default.
+
+The bound client's endpoint, credentials and headers are preserved. Every call
+fetches all pages afresh. A successful empty list stays empty; failures raise typed,
+sanitized errors rather than inventing a configured-model fallback. Hosts should
+offer manual exact entry when listing is unavailable. ModelInfo zero limits and
+empty capabilities mean unknown, not measured endpoint capabilities.
+`get_model_list_info()` reports the optional v1 filter schema and `provider-api`
+source without I/O. The unshipped candidate `discover_models` method is removed.
+Listing never restricts an explicitly selected inference model or changes its parameters.
 
 ## Silent-skip behavior
 
