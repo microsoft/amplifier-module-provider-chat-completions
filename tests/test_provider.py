@@ -1290,7 +1290,7 @@ class TestMessageEdgeCases:
         assert result[1]["content"] == "Hello"
 
     def test_image_block_url_format(self):
-        """ImageBlock with base64 source produces correct data: URL format."""
+        """Unknown endpoint/model image support is explicitly text-only."""
         provider = self._get_provider()
         msgs = [
             Message(
@@ -1310,11 +1310,10 @@ class TestMessageEdgeCases:
         result = provider._convert_messages_to_wire(msgs)
         assert len(result) == 1
         content = result[0]["content"]
-        assert isinstance(content, list)
-        # Find the image_url item
-        image_items = [item for item in content if item["type"] == "image_url"]
-        assert len(image_items) == 1
-        assert image_items[0]["image_url"]["url"] == "data:image/png;base64,abc123"
+        assert isinstance(content, str)
+        assert content.startswith("Look at this image\n[Image unavailable:")
+        assert "no pixels supplied]" in content
+        assert "abc123" not in content
 
     def test_empty_content_string(self):
         """Empty string content doesn't crash and passes through as empty string."""

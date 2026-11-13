@@ -5,6 +5,7 @@ making it available as the 'chat-completions' provider.
 """
 
 import asyncio
+import copy
 import difflib
 import json
 import logging
@@ -13,6 +14,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
+from contextvars import ContextVar
 from decimal import Decimal
 from typing import Any
 
@@ -20,6 +22,13 @@ import openai
 
 from ._cost import compute_cost
 from ._model_listing import ModelFilters, selector_schema
+from ._media import (
+    MEDIA_NAMESPACE,
+    UNAVAILABLE,
+    contains_media,
+    diagnostic_copy,
+    tool_output_text,
+)
 
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
@@ -55,6 +64,9 @@ __all__ = ["mount", "ChatCompletionsProvider", "ChatCompletionsChatResponse"]
 __amplifier_module_type__ = "provider"
 
 logger = logging.getLogger(__name__)
+_stream_attempt: ContextVar[dict[str, bool] | None] = ContextVar(
+    "chat_completions_stream_attempt", default=None
+)
 
 # Config keys this provider actively reads. `priority` is read by the
 # orchestrator's provider-selection logic AND by this module itself
@@ -448,7 +460,80 @@ class ChatCompletionsProvider:
             payload: The event payload dict.
         """
         if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
-            await self.coordinator.hooks.emit(name, payload)
+            await self.coordinator.hooks.emit(
+                name, redact_secrets(diagnostic_copy(payload))
+            )
+
+    def get_media_request_support(
+        self, *, model: str, request_options: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """No endpoint/model image positions are qualified on this generic route.
+
+        A familiar model name or OpenAI-compatible API does not establish vision.
+        Hosts must freeze unavailable text before counting, without hydration.
+        """
+        return {
+            "v": 1,
+            "positions": [],
+            "mime_types": [],
+            "reason": "selected endpoint/model image support is unqualified",
+        }
+
+    def _media_capability(self) -> Any:
+        getter = getattr(self.coordinator, "get_capability", None)
+        cap = getter(MEDIA_NAMESPACE) if callable(getter) else None
+        return (
+            cap
+            if cap is not None
+            and type(getattr(cap, "version", None)) is int
+            and cap.version == 1
+            else None
+        )
+
+    def _validate_media_attempt(
+        self, request: ChatRequest, request_options: dict[str, Any]
+    ) -> None:
+        """Validate the private host-owned projection, never hydrate or log it."""
+        cap = self._media_capability()
+        has_refs = any(
+            isinstance(message.metadata, dict) and MEDIA_NAMESPACE in message.metadata
+            for message in request.messages
+        )
+        if cap is None:
+            if has_refs:
+                raise KernelInvalidRequestError(
+                    "Media references require a compatible prepared-request owner",
+                    provider=self.name,
+                    retryable=False,
+                )
+            return
+        result = cap.validate(
+            request, purpose="transport", request_options=copy.deepcopy(request_options)
+        )
+        if not isinstance(result, dict) or result.get("valid") is not True:
+            raise KernelInvalidRequestError(
+                "Media preparation validation did not confirm this request",
+                provider=self.name,
+                retryable=False,
+            )
+
+    def _transport_binding(self) -> Any:
+        """Freeze effective account/model and local SDK controls across awaits."""
+        return copy.deepcopy(
+            (
+                self._base_url,
+                self._api_key,
+                self._model,
+                self._use_streaming,
+                self._top_p,
+                self._stop,
+                self._seed,
+                self._parallel_tool_calls,
+                self._extra_request_params,
+                self._default_headers,
+                self.config,
+            )
+        )
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -576,7 +661,7 @@ class ChatCompletionsProvider:
         # Emit repair event
         repaired_ids = [orphan[1] for orphan in orphans]
         if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
-            await self.coordinator.hooks.emit(
+            await self._emit_event(
                 "provider:tool_sequence_repaired",
                 {
                     "provider": self.name,
@@ -595,8 +680,8 @@ class ChatCompletionsProvider:
 
         Maps roles, joins text blocks, drops thinking blocks, converts tool
         call blocks to the ``tool_calls`` array, and converts tool result blocks
-        to ``role: 'tool'`` messages.  Images are converted to ``image_url``
-        content items.
+        to ``role: 'tool'`` messages. Images become explicit unavailable text:
+        this endpoint-agnostic route has no qualified image positions/models.
 
         Developer messages are wrapped in <context_file> XML and mapped to
         user role (matching the Anthropic provider convention).
@@ -623,6 +708,8 @@ class ChatCompletionsProvider:
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             text_parts_dev.append(block.text)
+                        elif isinstance(block, ImageBlock):
+                            text_parts_dev.append(UNAVAILABLE)
                     text = "\n".join(text_parts_dev)
                 wire.append(
                     {
@@ -647,7 +734,6 @@ class ChatCompletionsProvider:
             # List of content blocks — iterate and classify.
             text_parts: list[str] = []
             tool_calls_wire: list[dict[str, Any]] = []
-            image_parts: list[dict[str, Any]] = []
             tool_result_blocks: list[ToolResultBlock] = []
 
             for block in content:
@@ -669,9 +755,7 @@ class ChatCompletionsProvider:
                 elif isinstance(block, ToolResultBlock):
                     tool_result_blocks.append(block)
                 elif isinstance(block, ImageBlock):
-                    src = block.source
-                    url = f"data:{src['media_type']};base64,{src['data']}"
-                    image_parts.append({"type": "image_url", "image_url": {"url": url}})
+                    text_parts.append(UNAVAILABLE)
 
             if tool_result_blocks:
                 # Chat Completions needs one correlated tool message per result.
@@ -687,29 +771,24 @@ class ChatCompletionsProvider:
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_call_id,
-                            "content": str(block.output),
+                            "content": tool_output_text(block.output),
                         }
                     )
                 continue
 
             msg: dict[str, Any] = {"role": role}
 
-            if image_parts:
-                # Build a multimodal content array.
-                content_array: list[dict[str, Any]] = []
-                if text_parts:
-                    content_array.append(
-                        {"type": "text", "text": "\n".join(text_parts)}
-                    )
-                content_array.extend(image_parts)
-                msg["content"] = content_array
-            elif text_parts:
+            if text_parts:
                 msg["content"] = "\n".join(text_parts)
             else:
                 msg["content"] = None
 
             if tool_calls_wire:
                 msg["tool_calls"] = tool_calls_wire
+            if role == "tool":
+                if not message.tool_call_id:
+                    raise ValueError("A tool result requires tool_call_id")
+                msg["tool_call_id"] = message.tool_call_id
 
             wire.append(msg)
 
@@ -843,9 +922,7 @@ class ChatCompletionsProvider:
                 hasattr(usage_obj, "prompt_tokens_details")
                 and usage_obj.prompt_tokens_details
             ):
-                cached = (
-                    getattr(usage_obj.prompt_tokens_details, "cached_tokens", None)
-                )
+                cached = getattr(usage_obj.prompt_tokens_details, "cached_tokens", None)
             usage = Usage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
@@ -910,8 +987,22 @@ class ChatCompletionsProvider:
             params.update(self._extra_request_params)
 
         params.setdefault("timeout", self._sdk_timeout)
-        response = await self.client.chat.completions.create(**params)
-        return self._build_response(response), response
+        if request.tool_choice is not None:
+            params["tool_choice"] = request.tool_choice
+        response = await self.client.chat.completions.create(**copy.deepcopy(params))
+        attempt = _stream_attempt.get()
+        if attempt is not None:
+            attempt["received"] = True
+        try:
+            return self._build_response(response), response
+        except Exception as exc:
+            # The SDK already returned a response. A local decode failure is
+            # not permission to run the model again.
+            raise KernelInvalidRequestError(
+                "Received completion could not be decoded; not replayed",
+                provider=self.name,
+                retryable=False,
+            ) from exc
 
     async def _complete_streaming(
         self,
@@ -968,7 +1059,9 @@ class ChatCompletionsProvider:
             params.update(self._extra_request_params)
 
         params.setdefault("timeout", self._sdk_timeout)
-        stream = await self.client.chat.completions.create(**params)
+        if request.tool_choice is not None:
+            params["tool_choice"] = request.tool_choice
+        stream = await self.client.chat.completions.create(**copy.deepcopy(params))
 
         # ── Streaming event state ────────────────────────────────────────────
         # One request_id per call; shared across all llm:stream_* events.
@@ -987,8 +1080,13 @@ class ChatCompletionsProvider:
             self.coordinator, "hooks"
         )
 
+        observed_chunk = False
         try:
             async for chunk in stream:
+                observed_chunk = True
+                attempt = _stream_attempt.get()
+                if attempt is not None:
+                    attempt["received"] = True
                 # Capture usage if present on any chunk (typically the final one).
                 chunk_usage = getattr(chunk, "usage", None)
                 if chunk_usage is not None:
@@ -1015,7 +1113,7 @@ class ChatCompletionsProvider:
                         seq[bidx] = 0
                         next_block_index += 1
                         if hooks_available:
-                            await self.coordinator.hooks.emit(
+                            await self._emit_event(
                                 "llm:stream_block_start",
                                 {
                                     "request_id": request_id,
@@ -1026,7 +1124,7 @@ class ChatCompletionsProvider:
                             partial_emitted = True
                     bidx = block_index_map["thinking"]
                     if hooks_available:
-                        await self.coordinator.hooks.emit(
+                        await self._emit_event(
                             "llm:stream_block_delta",
                             {
                                 "request_id": request_id,
@@ -1049,7 +1147,7 @@ class ChatCompletionsProvider:
                         seq[bidx] = 0
                         next_block_index += 1
                         if hooks_available:
-                            await self.coordinator.hooks.emit(
+                            await self._emit_event(
                                 "llm:stream_block_start",
                                 {
                                     "request_id": request_id,
@@ -1060,7 +1158,7 @@ class ChatCompletionsProvider:
                             partial_emitted = True
                     bidx = block_index_map["text"]
                     if hooks_available:
-                        await self.coordinator.hooks.emit(
+                        await self._emit_event(
                             "llm:stream_block_delta",
                             {
                                 "request_id": request_id,
@@ -1104,7 +1202,7 @@ class ChatCompletionsProvider:
                                 )
                                 if fn_name:
                                     start_payload["name"] = fn_name
-                                await self.coordinator.hooks.emit(
+                                await self._emit_event(
                                     "llm:stream_block_start", start_payload
                                 )
                                 partial_emitted = True
@@ -1117,7 +1215,7 @@ class ChatCompletionsProvider:
             # ── After loop: emit block_end for every started block ───────────
             if hooks_available:
                 for bidx in sorted(block_types.keys()):
-                    await self.coordinator.hooks.emit(
+                    await self._emit_event(
                         "llm:stream_block_end",
                         {
                             "request_id": request_id,
@@ -1128,7 +1226,7 @@ class ChatCompletionsProvider:
 
         except Exception as _stream_exc:
             if partial_emitted and hooks_available:
-                await self.coordinator.hooks.emit(
+                await self._emit_event(
                     "llm:stream_aborted",
                     {
                         "request_id": request_id,
@@ -1138,6 +1236,12 @@ class ChatCompletionsProvider:
                         },
                     },
                 )
+            if observed_chunk:
+                raise KernelLLMError(
+                    "Stream interrupted after a received chunk; not replayed",
+                    provider=self.name,
+                    retryable=False,
+                ) from _stream_exc
             raise
 
         # Build content blocks from accumulated buffers.
@@ -1158,7 +1262,14 @@ class ChatCompletionsProvider:
             tool_calls = []
             for idx in sorted(tool_call_accum.keys()):
                 tc_data = tool_call_accum[idx]
-                arguments = json.loads(tc_data["arguments"])
+                try:
+                    arguments = json.loads(tc_data["arguments"])
+                except (TypeError, ValueError) as exc:
+                    raise KernelInvalidRequestError(
+                        "Received stream tool arguments could not be decoded; not replayed",
+                        provider=self.name,
+                        retryable=False,
+                    ) from exc
                 content.append(
                     ToolCallBlock(
                         id=tc_data["id"],
@@ -1255,10 +1366,14 @@ class ChatCompletionsProvider:
                 models: list[ModelInfo] = []
                 while True:
                     if not isinstance(page.data, list):
-                        raise ValueError("Model discovery response requires a data list")
+                        raise ValueError(
+                            "Model discovery response requires a data list"
+                        )
                     for model in page.data:
                         if not isinstance(model.id, str) or not model.id.strip():
-                            raise ValueError("Model discovery requires non-empty string IDs")
+                            raise ValueError(
+                                "Model discovery requires non-empty string IDs"
+                            )
                         models.append(self._model_info(model.id))
                     if not hasattr(page, "has_next_page") or not page.has_next_page():
                         return models
@@ -1316,6 +1431,33 @@ class ChatCompletionsProvider:
         Raises:
             KernelLLMError subclass on any provider failure.
         """
+        # The host owns hydration and count/send association. Never replace or
+        # mutate its private request (or the canonical REFONLY source).
+        request_snapshot = request.model_dump(mode="python")
+        request_options = copy.deepcopy(kwargs)
+        binding = self._transport_binding()
+        selected_client = self._client
+        selected_capability = self._media_capability()
+        media_path = selected_capability is not None or contains_media(request_snapshot)
+        extra_body = self._extra_request_params.get("extra_body", {})
+        protected_controls = {"model", "messages", "tools", "stream", "tool_choice"}
+        if contains_media(self._extra_request_params) or (
+            media_path
+            and (
+                set(self._extra_request_params) & protected_controls
+                or (
+                    isinstance(extra_body, Mapping)
+                    and set(extra_body) & protected_controls
+                )
+            )
+        ):
+            raise KernelInvalidRequestError(
+                "Expert overrides cannot replace prepared media/model/message controls",
+                provider=self.name,
+                retryable=False,
+            )
+        # Reference-bearing calls cannot bypass the host's preparation witness.
+        self._validate_media_attempt(request, request_options)
         messages = await self._repair_tool_sequence(request.messages)
         wire_messages = self._convert_messages_to_wire(messages)
         wire_tools = (
@@ -1330,7 +1472,7 @@ class ChatCompletionsProvider:
 
         async def _on_retry(attempt: int, delay: float, error: Any) -> None:
             if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
+                await self._emit_event(
                     "provider:retry",
                     {
                         "provider": self.name,
@@ -1342,13 +1484,16 @@ class ChatCompletionsProvider:
                     },
                 )
 
-        async def _single_attempt() -> ChatCompletionsChatResponse:
+        async def _attempt_body() -> ChatCompletionsChatResponse:
+            nonlocal selected_client
             start_time = time.monotonic()
 
             # Task 8: Build llm:request event payload, include raw params when raw=True
             request_payload: dict[str, Any] = {
                 "provider": self.name,
-                "model": self._model,
+                "model": request.model
+                or self._extra_request_params.get("model")
+                or self._model,
             }
             if self._raw:
                 raw_params: dict[str, Any] = {
@@ -1371,6 +1516,22 @@ class ChatCompletionsProvider:
             if isinstance(_meta, dict) and _meta.get("stream") is False:
                 _use_streaming = False
 
+            # Hooks/retry backoff may revoke access or mutate selection. A local
+            # refusal is outside SDK translation/retry: never turn it retryable.
+            if (
+                request.model_dump(mode="python") != request_snapshot
+                or binding != self._transport_binding()
+                or self._client is not selected_client
+                or self._media_capability() is not selected_capability
+            ):
+                raise KernelInvalidRequestError(
+                    "Prepared request or provider selection changed before transport",
+                    provider=self.name,
+                    retryable=False,
+                )
+            if selected_client is None:
+                selected_client = self.client
+            self._validate_media_attempt(request, request_options)
             try:
                 async with asyncio.timeout(self._timeout):
                     if _use_streaming:
@@ -1389,7 +1550,11 @@ class ChatCompletionsProvider:
                         )
             except Exception as exc:
                 duration_ms = (time.monotonic() - start_time) * 1000
-                kernel_error = self._translate_error(exc)
+                kernel_error = (
+                    exc
+                    if isinstance(exc, KernelLLMError)
+                    else self._translate_error(exc)
+                )
                 await self._emit_event(
                     "llm:response",
                     {
@@ -1439,6 +1604,26 @@ class ChatCompletionsProvider:
 
             await self._emit_event("llm:response", response_payload)
             return chat_response
+
+        async def _single_attempt() -> ChatCompletionsChatResponse:
+            # Covers the ENTIRE operation, including usage bookkeeping and both
+            # success/error observers. An observer cannot authorize a replay.
+            received = {"received": False}
+            token = _stream_attempt.set(received)
+            try:
+                return await _attempt_body()
+            except Exception as exc:
+                if received["received"]:
+                    if isinstance(exc, KernelLLMError) and not exc.retryable:
+                        raise
+                    raise KernelLLMError(
+                        "Completion failed after a received response/chunk; not replayed",
+                        provider=self.name,
+                        retryable=False,
+                    ) from exc
+                raise
+            finally:
+                _stream_attempt.reset(token)
 
         return await retry_with_backoff(
             _single_attempt, config=retry_config, on_retry=_on_retry

@@ -32,6 +32,39 @@ produces one wire tool message per result, in block order. An uncorrelated resul
 or a mixture of result and other content blocks is rejected before dispatch,
 rather than silently discarding evidence.
 
+### Media compatibility and diagnostic privacy
+
+This generic route does **not** qualify image support from an endpoint speaking
+Chat Completions or a familiar model name. `get_media_request_support` reports
+version 1 with no supported positions or MIME types for every selected model.
+Hosts must prepare unavailable text before counting, without hydrating pixels.
+User, historical, tool, assistant, system and developer image blocks become
+`[Image unavailable: selected endpoint/model image support is unqualified; no pixels supplied]`.
+Tool images stay in the matching call-bound tool result; they are never relocated
+into a fabricated user message. Original text order, call IDs and canonical
+metadata remain unchanged. This is honest text-only compatibility, not vision.
+
+The host owns private request preparation and immutable count/send association.
+When its `experimental.media.v1` capability is present, each transport attempt
+validates that exact private request with the original call options. Ref-bearing
+calls without a compatible capability fail locally. SDK retries remain disabled;
+provider retries revalidate after backoff. Changes to the request or effective
+provider selection refuse transport; media-bearing expert overrides of model,
+messages, tools or stream are not accepted. Interrupted streams are not replayed
+after any received chunk. This module has no native count/budget, public stream,
+refit or compaction method and does not claim those independent paths.
+
+Raw diagnostics remain opt-in and secret-redacted. Before any hook sees an event,
+the provider makes a separate copy and replaces known Core/Chat Completions image
+transports with an explicit not-retained marker. It neither ingests/publishes media
+for logging nor invents a resolvable digest/ref. Unknown opaque text and continuation
+fields are not JSON-decoded. Canonical history and actual SDK payloads are not
+diagnostic copies.
+
+Offline tests: `uv sync --frozen && uv run pytest -q`. Default tests clear API
+credentials and block sockets. Live-server tests skip without
+`--live-provider`; only use that flag under separate live-inference authority.
+
 ## Configuration
 
 | Key | Type | Default | Env Var |

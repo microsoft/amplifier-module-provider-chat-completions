@@ -30,9 +30,6 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run test suite
-        # tests/test_integration.py self-gates on a live-server health
-        # check (pytest.mark.skipif) and skips automatically when no
-        # llama-server/Ollama-compatible instance is reachable at
-        # localhost:8080 -- true on a fresh CI runner, so no extra
-        # deselection is needed here.
+        # Live integration requires explicit --live-provider. Default tests
+        # clear credentials and fence sockets; collection never probes a server.
         run: uv run pytest -q
