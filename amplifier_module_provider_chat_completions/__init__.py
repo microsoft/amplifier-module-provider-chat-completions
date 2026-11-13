@@ -990,6 +990,9 @@ class ChatCompletionsProvider:
         if request.tool_choice is not None:
             params["tool_choice"] = request.tool_choice
         response = await self.client.chat.completions.create(**copy.deepcopy(params))
+        attempt = _stream_attempt.get()
+        if attempt is not None:
+            attempt["received"] = True
         try:
             return self._build_response(response), response
         except Exception as exc:
@@ -1481,7 +1484,7 @@ class ChatCompletionsProvider:
                     },
                 )
 
-        async def _single_attempt() -> ChatCompletionsChatResponse:
+        async def _attempt_body() -> ChatCompletionsChatResponse:
             nonlocal selected_client
             start_time = time.monotonic()
 
@@ -1529,8 +1532,6 @@ class ChatCompletionsProvider:
             if selected_client is None:
                 selected_client = self.client
             self._validate_media_attempt(request, request_options)
-            stream_state = {"received": False}
-            stream_token = _stream_attempt.set(stream_state)
             try:
                 async with asyncio.timeout(self._timeout):
                     if _use_streaming:
@@ -1554,12 +1555,6 @@ class ChatCompletionsProvider:
                     if isinstance(exc, KernelLLMError)
                     else self._translate_error(exc)
                 )
-                if stream_state["received"]:
-                    kernel_error = KernelLLMError(
-                        "Stream failed after a received chunk; not replayed",
-                        provider=self.name,
-                        retryable=False,
-                    )
                 await self._emit_event(
                     "llm:response",
                     {
@@ -1570,8 +1565,6 @@ class ChatCompletionsProvider:
                     },
                 )
                 raise kernel_error from exc
-            finally:
-                _stream_attempt.reset(stream_token)
 
             duration_ms = (time.monotonic() - start_time) * 1000
             usage_dict: dict[str, Any] = {}
@@ -1611,6 +1604,26 @@ class ChatCompletionsProvider:
 
             await self._emit_event("llm:response", response_payload)
             return chat_response
+
+        async def _single_attempt() -> ChatCompletionsChatResponse:
+            # Covers the ENTIRE operation, including usage bookkeeping and both
+            # success/error observers. An observer cannot authorize a replay.
+            received = {"received": False}
+            token = _stream_attempt.set(received)
+            try:
+                return await _attempt_body()
+            except Exception as exc:
+                if received["received"]:
+                    if isinstance(exc, KernelLLMError) and not exc.retryable:
+                        raise
+                    raise KernelLLMError(
+                        "Completion failed after a received response/chunk; not replayed",
+                        provider=self.name,
+                        retryable=False,
+                    ) from exc
+                raise
+            finally:
+                _stream_attempt.reset(token)
 
         return await retry_with_backoff(
             _single_attempt, config=retry_config, on_retry=_on_retry

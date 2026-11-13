@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import openai
 import pytest
-from amplifier_core.llm_errors import InvalidRequestError, LLMError
+from amplifier_core.llm_errors import InvalidRequestError, LLMError, RateLimitError
 from amplifier_core.message_models import (
     ChatRequest,
     ImageBlock,
@@ -433,6 +433,33 @@ async def test_all_postchunk_failures_refuse_replay(failure):
             raise openai.APIConnectionError(request=MagicMock())
 
     p._client.chat.completions.create.return_value = chunks()
+    with pytest.raises(LLMError) as exc:
+        await p.complete(ChatRequest(messages=[Message(role="user", content="hi")]))
+    assert exc.value.retryable is False
+    assert p._client.chat.completions.create.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("failed_transport", [False, True])
+async def test_retryable_response_observer_cannot_replay_received_result(
+    stream, failed_transport
+):
+    async def hook(name, payload):
+        if name == "llm:response":
+            raise RateLimitError("retryable observer", retryable=True)
+
+    p, _ = provider(stream=stream, retries=2, hook=hook)
+    if stream:
+
+        async def chunks():
+            yield SimpleNamespace(choices=[], usage=None)
+            if failed_transport:
+                raise openai.APIConnectionError(request=MagicMock())
+
+        p._client.chat.completions.create.return_value = chunks()
+    elif failed_transport:
+        p._build_response = MagicMock(side_effect=ValueError("bad completion"))
     with pytest.raises(LLMError) as exc:
         await p.complete(ChatRequest(messages=[Message(role="user", content="hi")]))
     assert exc.value.retryable is False
