@@ -1,5 +1,6 @@
 """Route-local fallback and non-retaining diagnostic copies. No storage API."""
 
+import base64
 import copy
 import re
 from typing import Any
@@ -13,6 +14,35 @@ UNAVAILABLE = (
 )
 NOT_RETAINED = "[Image transport not retained in diagnostics]"
 _DATA_IMAGE = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+")
+# Literal IDs/snapshots from official model pages fetched 2026-11-14. Absence
+# means unqualified, NOT that the model is incapable. Never infer from a prefix.
+OFFICIAL_USER_IMAGE_MODELS = {
+    "gpt-6.1-sol": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+    "gpt-5.4": "https://developers.openai.com/api/docs/models/gpt-5.4",
+    "gpt-5.4-2026-03-05": "https://developers.openai.com/api/docs/models/gpt-5.4",
+    "gpt-5.5": "https://developers.openai.com/api/docs/models/gpt-5.5",
+    "gpt-5.5-2026-04-23": "https://developers.openai.com/api/docs/models/gpt-5.5",
+}
+OFFICIAL_BASE_URLS = ("https://api.openai.com/v1", "https://api.openai.com/v1/")
+
+
+def user_image_part(block: ImageBlock) -> dict[str, Any] | None:
+    """Encode verified private PNG/JPEG transport, never resolve refs or paths."""
+    source = block.source
+    mime, data = source.get("media_type"), source.get("data")
+    if source.get("type") != "base64" or mime not in ("image/png", "image/jpeg"):
+        return None
+    if not isinstance(data, str) or not data:
+        return None
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (ValueError, TypeError):
+        return None
+    # The session owner verifies decoding/dimensions. This final encoder only
+    # accepts the original supported transport; it neither transcodes nor logs.
+    if not decoded:
+        return None
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
 
 
 def contains_media(value: Any) -> bool:

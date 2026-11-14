@@ -24,10 +24,13 @@ from ._cost import compute_cost
 from ._model_listing import ModelFilters, selector_schema
 from ._media import (
     MEDIA_NAMESPACE,
+    OFFICIAL_BASE_URLS,
+    OFFICIAL_USER_IMAGE_MODELS,
     UNAVAILABLE,
     contains_media,
     diagnostic_copy,
     tool_output_text,
+    user_image_part,
 )
 
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
@@ -64,6 +67,7 @@ __all__ = ["mount", "ChatCompletionsProvider", "ChatCompletionsChatResponse"]
 __amplifier_module_type__ = "provider"
 
 logger = logging.getLogger(__name__)
+_SDK_CLIENT_TYPE = openai.AsyncOpenAI
 _stream_attempt: ContextVar[dict[str, bool] | None] = ContextVar(
     "chat_completions_stream_attempt", default=None
 )
@@ -214,6 +218,8 @@ class ChatCompletionsProvider:
             self.config.get("default_model") or self.config.get("model") or "default"
         )
         self._client: openai.AsyncOpenAI | None = None
+        self._owned_client: openai.AsyncOpenAI | None = None
+        self._owned_route: tuple[Any, ...] | None = None
         # Silence while a model works is not evidence of a failed request.
         self._timeout: float | None = self._config_float(
             self.config.get("timeout"), None
@@ -321,10 +327,17 @@ class ChatCompletionsProvider:
                 api_key=self._api_key,
                 timeout=self._sdk_timeout,
                 default_headers=self._default_headers,
+                http_client=(
+                    openai.DefaultAsyncHttpxClient(follow_redirects=False)
+                    if self._base_url in OFFICIAL_BASE_URLS
+                    else None
+                ),
                 max_retries=0,  # Intentional: disables the openai SDK's built-in retry
                 # layer. The provider manages retries itself via
                 # retry_with_backoff() from amplifier-core.
             )
+            self._owned_client = self._client
+            self._owned_route = self._route_signature(self._client)
         return self._client
 
     def _translate_error(self, exc: Exception) -> KernelLLMError:
@@ -467,11 +480,31 @@ class ChatCompletionsProvider:
     def get_media_request_support(
         self, *, model: str, request_options: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """No endpoint/model image positions are qualified on this generic route.
-
-        A familiar model name or OpenAI-compatible API does not establish vision.
-        Hosts must freeze unavailable text before counting, without hydration.
-        """
+        """Qualify documented literal models on this instance's official client."""
+        options = request_options or {}
+        selected = options.get("model") or model
+        if (
+            isinstance(selected, str)
+            and selected in OFFICIAL_USER_IMAGE_MODELS
+            and self._base_url in OFFICIAL_BASE_URLS
+            and not self._extra_request_params
+            and not self._default_headers
+        ):
+            client = self.client  # Construction only; no discovery/network.
+            if (
+                type(client) is _SDK_CLIENT_TYPE
+                and client is self._owned_client
+                and str(client.base_url) in OFFICIAL_BASE_URLS
+                and client.max_retries == 0
+                and client._client.follow_redirects is False
+                and self._owned_route == self._route_signature(client)
+            ):
+                return {
+                    "v": 1,
+                    "positions": ["user"],
+                    "mime_types": ["image/png", "image/jpeg"],
+                    "evidence": OFFICIAL_USER_IMAGE_MODELS[selected],
+                }
         return {
             "v": 1,
             "positions": [],
@@ -532,7 +565,75 @@ class ChatCompletionsProvider:
                 self._extra_request_params,
                 self._default_headers,
                 self.config,
+                (
+                    str(self._client.base_url),
+                    self._client.api_key,
+                    self._client.organization,
+                    self._client.project,
+                    {
+                        k: v
+                        for k, v in self._client.default_headers.items()
+                        if isinstance(v, str)
+                    },
+                    self._client.max_retries,
+                    self._client._client.follow_redirects,
+                )
+                if type(self._client) is _SDK_CLIENT_TYPE
+                else None,
             )
+        )
+
+    @staticmethod
+    def _route_signature(client: Any) -> tuple[Any, ...]:
+        """Pin provider-owned resource dispatch and mutable HTTP request routing."""
+
+        def method(value: Any) -> tuple[int, int]:
+            return (
+                id(getattr(value, "__self__", None)),
+                id(getattr(value, "__func__", value)),
+            )
+
+        http = client._client
+        resource = client.chat.completions
+        return (
+            id(http),
+            id(resource),
+            tuple(
+                method(getattr(resource, name, None))
+                for name in ("create", "_post", "_get")
+            ),
+            tuple(
+                method(getattr(client, name, None))
+                for name in (
+                    "post",
+                    "request",
+                    "_request",
+                    "_build_request",
+                    "_prepare_request",
+                    "_prepare_options",
+                )
+            ),
+            tuple(
+                method(getattr(http, name, None))
+                for name in (
+                    "send",
+                    "request",
+                    "build_request",
+                    "_send_handling_auth",
+                    "_send_handling_redirects",
+                    "_send_single_request",
+                )
+            ),
+            id(http.auth),
+            id(http._transport),
+            tuple((id(key), id(value)) for key, value in http._mounts.items()),
+            tuple(
+                (key, tuple(id(hook) for hook in hooks))
+                for key, hooks in http.event_hooks.items()
+            ),
+            str(http.params),
+            tuple(http.headers.multi_items()),
+            str(client.default_query),
         )
 
     def _find_missing_tool_results(
@@ -674,14 +775,18 @@ class ChatCompletionsProvider:
         return result
 
     def _convert_messages_to_wire(
-        self, messages: list[Message]
+        self,
+        messages: list[Message],
+        *,
+        model: str | None = None,
+        request_options: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Convert internal Message list to OpenAI-compatible wire format.
 
         Maps roles, joins text blocks, drops thinking blocks, converts tool
         call blocks to the ``tool_calls`` array, and converts tool result blocks
-        to ``role: 'tool'`` messages. Images become explicit unavailable text:
-        this endpoint-agnostic route has no qualified image positions/models.
+        to ``role: 'tool'`` messages. Only documented official-route user images
+        are encoded. Unsupported positions remain truthful text, never relocated.
 
         Developer messages are wrapped in <context_file> XML and mapped to
         user role (matching the Anthropic provider convention).
@@ -693,6 +798,12 @@ class ChatCompletionsProvider:
             List of dicts suitable for ``client.chat.completions.create``.
         """
         wire: list[dict[str, Any]] = []
+        user_images = (
+            "user"
+            in self.get_media_request_support(
+                model=model or self._model, request_options=request_options
+            )["positions"]
+        )
 
         # Prepend developer messages before user messages in wire format.
         ordered = [m for m in messages if m.role == "developer"] + [
@@ -733,12 +844,15 @@ class ChatCompletionsProvider:
 
             # List of content blocks — iterate and classify.
             text_parts: list[str] = []
+            ordered_parts: list[dict[str, Any]] = []
+            has_image = False
             tool_calls_wire: list[dict[str, Any]] = []
             tool_result_blocks: list[ToolResultBlock] = []
 
             for block in content:
                 if isinstance(block, TextBlock):
                     text_parts.append(block.text)
+                    ordered_parts.append({"type": "text", "text": block.text})
                 elif isinstance(block, ThinkingBlock):
                     pass  # Silently drop thinking blocks
                 elif isinstance(block, ToolCallBlock):
@@ -755,7 +869,17 @@ class ChatCompletionsProvider:
                 elif isinstance(block, ToolResultBlock):
                     tool_result_blocks.append(block)
                 elif isinstance(block, ImageBlock):
-                    text_parts.append(UNAVAILABLE)
+                    part = (
+                        user_image_part(block)
+                        if role == "user" and user_images
+                        else None
+                    )
+                    if part is not None:
+                        ordered_parts.append(part)
+                        has_image = True
+                    else:
+                        text_parts.append(UNAVAILABLE)
+                        ordered_parts.append({"type": "text", "text": UNAVAILABLE})
 
             if tool_result_blocks:
                 # Chat Completions needs one correlated tool message per result.
@@ -778,7 +902,9 @@ class ChatCompletionsProvider:
 
             msg: dict[str, Any] = {"role": role}
 
-            if text_parts:
+            if has_image:
+                msg["content"] = ordered_parts
+            elif text_parts:
                 msg["content"] = "\n".join(text_parts)
             else:
                 msg["content"] = None
@@ -956,6 +1082,8 @@ class ChatCompletionsProvider:
         wire_messages: list[dict[str, Any]],
         wire_tools: list[dict[str, Any]] | None,
         request: "ChatRequest",
+        *,
+        model: str | None = None,
     ) -> "tuple[ChatCompletionsChatResponse, Any]":
         """Execute a non-streaming chat completion and return a ChatCompletionsChatResponse.
 
@@ -967,7 +1095,7 @@ class ChatCompletionsProvider:
         Returns:
             A tuple of (ChatCompletionsChatResponse, raw_api_response).
         """
-        model = request.model or self._model
+        model = model or request.model or self._model
         params: dict[str, Any] = dict(
             model=model,
             messages=wire_messages,
@@ -1009,6 +1137,8 @@ class ChatCompletionsProvider:
         wire_messages: list[dict[str, Any]],
         wire_tools: list[dict[str, Any]] | None,
         request: "ChatRequest",
+        *,
+        model: str | None = None,
     ) -> "tuple[ChatCompletionsChatResponse, None]":
         """Execute a streaming chat completion and accumulate chunks into a ChatCompletionsChatResponse.
 
@@ -1030,7 +1160,7 @@ class ChatCompletionsProvider:
             A tuple of (ChatCompletionsChatResponse, None). Streaming has no
             single raw response object to dump, so the second element is always None.
         """
-        model = request.model or self._model
+        model = model or request.model or self._model
 
         text_buffer: str = ""
         thinking_buffer: str = ""
@@ -1232,7 +1362,7 @@ class ChatCompletionsProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(_stream_exc).__name__,
-                            "msg": str(_stream_exc),
+                            "msg": "Stream interrupted; transport details not retained",
                         },
                     },
                 )
@@ -1434,9 +1564,39 @@ class ChatCompletionsProvider:
         # The host owns hydration and count/send association. Never replace or
         # mutate its private request (or the canonical REFONLY source).
         request_snapshot = request.model_dump(mode="python")
-        request_options = copy.deepcopy(kwargs)
+        nested_options = kwargs.get("request_options")
+        if nested_options is not None and not isinstance(nested_options, Mapping):
+            raise KernelInvalidRequestError(
+                "request_options must be a mapping", provider=self.name, retryable=False
+            )
+        request_options = copy.deepcopy(
+            {
+                **(nested_options or {}),
+                **{k: v for k, v in kwargs.items() if k != "request_options"},
+            }
+        )
+        model = request_options.get("model") or request.model or self._model
+        support = self.get_media_request_support(
+            model=model, request_options=request_options
+        )
+        if (
+            model == "gpt-6.1-sol"
+            and request.tools
+            and self._base_url in OFFICIAL_BASE_URLS
+        ):
+            raise KernelInvalidRequestError(
+                "gpt-6.1-sol tool calling requires the Responses API; use a qualified route",
+                provider=self.name,
+                retryable=False,
+            )
+        # Capture after our lazy construction, never refresh after a hook.
+        selected_client = self.client
         binding = self._transport_binding()
-        selected_client = self._client
+        selected_route = (
+            self._route_signature(selected_client)
+            if type(selected_client) is _SDK_CLIENT_TYPE
+            else None
+        )
         selected_capability = self._media_capability()
         media_path = selected_capability is not None or contains_media(request_snapshot)
         extra_body = self._extra_request_params.get("extra_body", {})
@@ -1459,7 +1619,9 @@ class ChatCompletionsProvider:
         # Reference-bearing calls cannot bypass the host's preparation witness.
         self._validate_media_attempt(request, request_options)
         messages = await self._repair_tool_sequence(request.messages)
-        wire_messages = self._convert_messages_to_wire(messages)
+        wire_messages = self._convert_messages_to_wire(
+            messages, model=model, request_options=request_options
+        )
         wire_tools = (
             self._convert_tools_to_wire(request.tools) if request.tools else None
         )
@@ -1491,13 +1653,11 @@ class ChatCompletionsProvider:
             # Task 8: Build llm:request event payload, include raw params when raw=True
             request_payload: dict[str, Any] = {
                 "provider": self.name,
-                "model": request.model
-                or self._extra_request_params.get("model")
-                or self._model,
+                "model": model,
             }
             if self._raw:
                 raw_params: dict[str, Any] = {
-                    "model": request.model or self._model,
+                    "model": model,
                     "messages": wire_messages,
                     "stream": self._use_streaming,
                 }
@@ -1523,6 +1683,14 @@ class ChatCompletionsProvider:
                 or binding != self._transport_binding()
                 or self._client is not selected_client
                 or self._media_capability() is not selected_capability
+                or (
+                    selected_route is not None
+                    and selected_route != self._route_signature(selected_client)
+                )
+                or support
+                != self.get_media_request_support(
+                    model=model, request_options=request_options
+                )
             ):
                 raise KernelInvalidRequestError(
                     "Prepared request or provider selection changed before transport",
@@ -1539,14 +1707,14 @@ class ChatCompletionsProvider:
                             chat_response,
                             raw_api_response,
                         ) = await self._complete_streaming(
-                            wire_messages, wire_tools, request
+                            wire_messages, wire_tools, request, model=model
                         )
                     else:
                         (
                             chat_response,
                             raw_api_response,
                         ) = await self._complete_non_streaming(
-                            wire_messages, wire_tools, request
+                            wire_messages, wire_tools, request, model=model
                         )
             except Exception as exc:
                 duration_ms = (time.monotonic() - start_time) * 1000
@@ -1555,6 +1723,18 @@ class ChatCompletionsProvider:
                     if isinstance(exc, KernelLLMError)
                     else self._translate_error(exc)
                 )
+                if media_path:
+                    # SDK error bodies/URLs may echo raw base64 without its
+                    # data-URL prefix. Never expose them through retry events,
+                    # exception messages or chained SDK causes.
+                    kernel_error = type(kernel_error)(
+                        "Media completion transport failed; details not retained",
+                        provider=self.name,
+                        model=model,
+                        retryable=kernel_error.retryable,
+                        status_code=getattr(kernel_error, "status_code", None),
+                        retry_after=getattr(kernel_error, "retry_after", None),
+                    )
                 await self._emit_event(
                     "llm:response",
                     {
@@ -1564,6 +1744,8 @@ class ChatCompletionsProvider:
                         "error_type": type(exc).__name__,
                     },
                 )
+                if media_path:
+                    raise kernel_error from None
                 raise kernel_error from exc
 
             duration_ms = (time.monotonic() - start_time) * 1000
