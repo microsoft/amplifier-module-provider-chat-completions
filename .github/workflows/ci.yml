@@ -27,9 +27,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
+
+      - name: Exercise declared SDK floor
+        # Keep this explicit even if a future lock refresh selects a newer SDK.
+        run: |
+          uv pip install "openai==2.32.0"
+          uv run --no-sync python -c "import openai; assert openai.__version__ == '2.32.0'"
 
       - name: Run test suite
         # Live integration requires explicit --live-provider. Default tests
         # clear credentials and fence sockets; collection never probes a server.
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q

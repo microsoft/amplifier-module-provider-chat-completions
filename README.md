@@ -34,6 +34,15 @@ rather than silently discarding evidence.
 
 ### Media compatibility and diagnostic privacy
 
+The supported OpenAI Python SDK minimum is **2.32.0**, the maintained and
+lockfile-tested floor for this route. The official-client constructor uses its
+public `DefaultAsyncHttpxClient(follow_redirects=False)` API; SDK 1.0.0 does not
+export that API and is not supported, even for text-only requests. This is an
+intentional compatibility-floor correction, not a claim that 2.32.0 was the
+first historical SDK release exposing the helper. CI checks the exact declared
+floor with real, unpatched client construction; real HTTP serializer tests run
+offline at the floor. SDK 3.46.0 has also been separately qualified.
+
 Image support requires actual instance and route facts, not a familiar model
 prefix or an arbitrary `supports_images` metadata flag. The provider's own
 unmodified `AsyncOpenAI` client at exactly `https://api.openai.com/v1` qualifies

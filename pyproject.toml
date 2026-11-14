@@ -9,7 +9,7 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "openai>=1.0.0",
+    "openai>=2.32.0",
 ]
 
 [project.entry-points."amplifier.modules"]
