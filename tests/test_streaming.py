@@ -287,10 +287,16 @@ async def test_reasoning_model_emits_thinking_block_delta_before_text_block_delt
     assert all("block_type" in d for d in all_deltas)
 
     # Thinking deltas (block_type="thinking") come before text deltas (block_type="text")
-    thinking_deltas = [(i, n) for i, (n, p) in enumerate(stream)
-                       if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"]
-    text_deltas = [(i, n) for i, (n, p) in enumerate(stream)
-                   if n == "llm:stream_block_delta" and p.get("block_type") == "text"]
+    thinking_deltas = [
+        (i, n)
+        for i, (n, p) in enumerate(stream)
+        if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"
+    ]
+    text_deltas = [
+        (i, n)
+        for i, (n, p) in enumerate(stream)
+        if n == "llm:stream_block_delta" and p.get("block_type") == "text"
+    ]
     assert thinking_deltas, "Expected at least one thinking block_delta"
     assert text_deltas, "Expected at least one text block_delta"
     assert thinking_deltas[-1][0] < text_deltas[0][0], (
@@ -525,7 +531,9 @@ async def test_mid_stream_error_after_partial_emits_aborted():
     assert "request_id" in payload
     assert "error" in payload
     assert payload["error"]["type"] == "RuntimeError"
-    assert "connection lost" in payload["error"]["msg"]
+    assert (
+        payload["error"]["msg"] == "Stream interrupted; transport details not retained"
+    )
 
 
 @pytest.mark.asyncio

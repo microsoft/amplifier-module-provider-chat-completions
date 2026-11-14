@@ -32,6 +32,77 @@ produces one wire tool message per result, in block order. An uncorrelated resul
 or a mixture of result and other content blocks is rejected before dispatch,
 rather than silently discarding evidence.
 
+### Media compatibility and diagnostic privacy
+
+The supported OpenAI Python SDK minimum is **2.32.0**, the maintained and
+lockfile-tested floor for this route. The official-client constructor uses its
+public `DefaultAsyncHttpxClient(follow_redirects=False)` API; SDK 1.0.0 does not
+export that API and is not supported, even for text-only requests. This is an
+intentional compatibility-floor correction, not a claim that 2.32.0 was the
+first historical SDK release exposing the helper. CI checks the exact declared
+floor with real, unpatched client construction; real HTTP serializer tests run
+offline at the floor. SDK 3.46.0 has also been separately qualified.
+
+Image support requires actual instance and route facts, not a familiar model
+prefix or an arbitrary `supports_images` metadata flag. The provider's own
+unmodified `AsyncOpenAI` client at exactly `https://api.openai.com/v1` qualifies
+PNG/JPEG **user** image parts for this initial documented literal catalog:
+
+| Exact model IDs | Official route/image-input evidence |
+|---|---|
+| `gpt-6.1-sol` | [Sol model](https://developers.openai.com/api/docs/models/gpt-6.1-sol) |
+| `gpt-5.4`, `gpt-5.4-2026-03-05` | [GPT-5.4 model](https://developers.openai.com/api/docs/models/gpt-5.4) |
+| `gpt-5.5`, `gpt-5.5-2026-04-23` | [GPT-5.5 model](https://developers.openai.com/api/docs/models/gpt-5.5) |
+
+These pages and the [image guide](https://developers.openai.com/api/docs/guides/images-vision)
+were checked on 2026-11-14. They establish documented API support, **not**
+live account entitlement. Sol tool calling requires Responses: this route refuses
+Sol requests with tools rather than dropping them or claiming combined support.
+Supported user images, including history, retain their content-part index and
+original decoded PNG/JPEG bytes; no transcoding or new message is performed.
+
+The catalog is intentionally explicit and incomplete: an omitted model is
+**unqualified, not necessarily incapable**. Custom endpoints, SDK provider
+adapters, injected/replaced clients, custom default headers, expert body overrides
+and undocumented aliases are not inferred to support images. Qualified official
+clients disable redirects and SDK retries. Other deployments need separate
+instance/model/route evidence before being added, not an optimistic opt-in.
+
+`get_media_request_support` reports version 1, `positions=["user"]` and PNG/JPEG
+MIME types only on the qualified route; otherwise both lists are empty.
+Hosts freeze unsupported text **before counting**, without hydrating pixels.
+Tool, assistant, system, developer and unqualified user images become
+`[Image unavailable: selected endpoint/model image support is unqualified; no pixels supplied]`.
+Tool images stay in the matching call-bound tool result; they are never relocated
+into a fabricated user message. Original text order, call IDs and canonical
+metadata remain unchanged. SDK schemas permit text-only tool content, not images.
+
+The host owns private request preparation and immutable count/send association.
+When its `experimental.media.v1` capability is present, each transport attempt
+validates that exact private request with the original call options. Ref-bearing
+calls without a compatible capability fail locally. SDK retries remain disabled;
+provider retries revalidate after backoff. Changes to the request or effective
+provider selection refuse transport; media-bearing expert overrides of model,
+messages, tools or stream are not accepted. Interrupted streams are not replayed
+after any received chunk, including observer/postprocessing errors. Effective
+model options and actual client endpoint/account/header/retry state are bound
+before each attempt. This module has no native count/budget, public stream,
+refit or compaction method and does not claim those independent paths.
+
+Raw diagnostics remain opt-in and secret-redacted. Before any hook sees an event,
+the provider makes a separate copy and replaces known Core/Chat Completions image
+transports with an explicit not-retained marker. It neither ingests/publishes media
+for logging nor invents a resolvable digest/ref. Unknown opaque text and continuation
+fields are not JSON-decoded. Canonical history and actual SDK payloads are not
+diagnostic copies.
+Known media transport errors and stream-abort events also omit SDK error details
+that could echo raw image bytes, rather than treating a successful redaction of
+the ordinary request log as sufficient.
+
+Offline tests: `uv sync --frozen && uv run pytest -q`. Default tests clear API
+credentials and block sockets. Live-server tests skip without
+`--live-provider`; only use that flag under separate live-inference authority.
+
 ## Configuration
 
 | Key | Type | Default | Env Var |

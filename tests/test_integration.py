@@ -1,7 +1,7 @@
 """Integration tests for ChatCompletionsProvider against a live llama-server.
 
 These tests require a running llama-server or Ollama-compatible instance.
-They are skipped automatically if the server is not reachable.
+They are skipped unless explicitly opted into. Collection never probes a server.
 
 Environment variables:
     INTEGRATION_BASE_URL: Override the server base URL
@@ -11,14 +11,12 @@ Environment variables:
                           (default: gemma26-long)
 
 Run integration tests explicitly:
-    pytest tests/test_integration.py -v
+    pytest tests/test_integration.py --live-provider -v
 
-These tests are NOT included in the default pytest run (see conftest.py).
+These tests are skipped in the default pytest run (see conftest.py).
 """
 
 import os
-import urllib.request
-import urllib.error
 
 import pytest
 
@@ -42,26 +40,7 @@ INTEGRATION_BASE_URL: str = os.environ.get(
 INTEGRATION_MODEL: str = os.environ.get("INTEGRATION_MODEL", "gemma26-long")
 
 
-def _server_reachable() -> bool:
-    """Return True if the configured llama-server health endpoint responds OK."""
-    # Strip trailing /v1 or /v1/ to get the base server URL
-    base = INTEGRATION_BASE_URL.rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
-    health_url = f"{base}/health"
-    try:
-        with urllib.request.urlopen(health_url, timeout=5) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
-
-
-_SERVER_UP = _server_reachable()
-
-pytestmark = pytest.mark.skipif(
-    not _SERVER_UP,
-    reason=f"llama-server not reachable at {INTEGRATION_BASE_URL} — skipping integration tests",
-)
+pytestmark = pytest.mark.live_provider
 
 
 # ---------------------------------------------------------------------------
