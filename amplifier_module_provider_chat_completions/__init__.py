@@ -595,35 +595,34 @@ class ChatCompletionsProvider:
 
         http = client._client
         resource = client.chat.completions
+
+        def callables(owner: Any) -> tuple[Any, ...]:
+            # All ordinary callable descriptors and instance overrides, not a
+            # guessed list of private SDK helpers. Avoid properties/cached
+            # resources (which can construct unrelated API clients).
+            names = set()
+            for cls in type(owner).__mro__:
+                names.update(
+                    name
+                    for name, value in vars(cls).items()
+                    if not name.startswith("__") and callable(value)
+                )
+            names.update(
+                name
+                for name, value in vars(owner).items()
+                if not name.startswith("__") and callable(value)
+            )
+            return tuple(
+                (name, method(getattr(owner, name, None))) for name in sorted(names)
+            )
+
         return (
             id(http),
             id(resource),
-            tuple(
-                method(getattr(resource, name, None))
-                for name in ("create", "_post", "_get")
-            ),
-            tuple(
-                method(getattr(client, name, None))
-                for name in (
-                    "post",
-                    "request",
-                    "_request",
-                    "_build_request",
-                    "_prepare_request",
-                    "_prepare_options",
-                )
-            ),
-            tuple(
-                method(getattr(http, name, None))
-                for name in (
-                    "send",
-                    "request",
-                    "build_request",
-                    "_send_handling_auth",
-                    "_send_handling_redirects",
-                    "_send_single_request",
-                )
-            ),
+            callables(resource),
+            callables(client),
+            callables(http),
+            callables(http._transport),
             id(http.auth),
             id(http._transport),
             tuple((id(key), id(value)) for key, value in http._mounts.items()),
@@ -1579,10 +1578,16 @@ class ChatCompletionsProvider:
         support = self.get_media_request_support(
             model=model, request_options=request_options
         )
+        effective_model = self._extra_request_params.get("model", model)
+        effective_tools = self._extra_request_params.get("tools", request.tools)
+        effective_body = self._extra_request_params.get("extra_body")
+        if isinstance(effective_body, Mapping):
+            effective_model = effective_body.get("model", effective_model)
+            effective_tools = effective_body.get("tools", effective_tools)
         if (
-            model == "gpt-6.1-sol"
-            and request.tools
-            and self._base_url in OFFICIAL_BASE_URLS
+            effective_model == "gpt-6.1-sol"
+            and effective_tools
+            and str(self.client.base_url) in OFFICIAL_BASE_URLS
         ):
             raise KernelInvalidRequestError(
                 "gpt-6.1-sol tool calling requires the Responses API; use a qualified route",

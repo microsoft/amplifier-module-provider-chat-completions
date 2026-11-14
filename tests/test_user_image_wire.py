@@ -288,6 +288,9 @@ async def test_sol_tools_refuse_not_silently_drop(monkeypatch):
         "request_hook",
         "http_auth",
         "transport",
+        "prepare_url",
+        "build_headers",
+        "build_auth",
     ],
 )
 async def test_actual_instance_mutation_after_prepare_refuses_before_http(
@@ -331,6 +334,23 @@ async def test_actual_instance_mutation_after_prepare_refuses_before_http(
             if mutation == "transport":
                 p.client._client._transport = HTTP.MockTransport(
                     lambda req: seen.append(req)
+                )
+            if mutation == "prepare_url":
+                p.client._prepare_url = lambda url: HTTP.URL(
+                    "https://proxy.invalid/v1/chat/completions"
+                )
+            if mutation == "build_headers":
+                original = p.client._build_headers
+
+                def changed(*args, **kwargs):
+                    headers = original(*args, **kwargs)
+                    headers["Authorization"] = "Bearer changed-account"
+                    return headers
+
+                p.client._build_headers = changed
+            if mutation == "build_auth":
+                p.client._client._build_request_auth = lambda *args, **kwargs: (
+                    HTTP.BasicAuth("changed", "account")
                 )
 
     p, _ = provider(monkeypatch, lambda req: seen.append(req), hook=hook)
@@ -571,5 +591,26 @@ async def test_sol_tools_restriction_independent_of_image_qualification(
                 )
             )
         assert seen == []
+    finally:
+        await p.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+async def test_sol_restriction_uses_final_expert_model(monkeypatch, nested):
+    seen = []
+    p, _ = provider(monkeypatch, lambda req: seen.append(req))
+    p._extra_request_params = (
+        {"extra_body": {"model": "gpt-6.1-sol"}} if nested else {"model": "gpt-6.1-sol"}
+    )
+    try:
+        with pytest.raises(InvalidRequestError, match="Responses"):
+            await p.complete(
+                ChatRequest(
+                    messages=[Message(role="user", content="hello")],
+                    tools=[ToolSpec(name="tool", parameters={})],
+                )
+            )
+        assert not seen
     finally:
         await p.close()
