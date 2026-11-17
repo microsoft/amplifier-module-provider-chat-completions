@@ -42,12 +42,13 @@ def call(*ids):
 
 
 class WireFixture:
-    def __init__(self, stream=False, status=200, mutate_hook=False):
+    def __init__(self, stream=False, status=200, mutate_hook=False, echo=False):
         self.requests = []
         self.events = []
         self.stream = stream
         self.status = status
         self.mutate_hook = mutate_hook
+        self.echo = echo
         self.provider = ChatCompletionsProvider(
             {
                 "model": "unknown-backend-alias",
@@ -105,7 +106,10 @@ class WireFixture:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
+                        "message": {
+                            "role": "assistant",
+                            "content": f"echo {PNG} {URL}" if self.echo else "ok",
+                        },
                         "finish_reason": "stop",
                     }
                 ],
@@ -118,7 +122,7 @@ class WireFixture:
         )
         before = copy.deepcopy(request.model_dump())
         try:
-            await self.provider.complete(request)
+            self.response = await self.provider.complete(request)
             assert request.model_dump() == before
             return self.requests[-1]["messages"]
         finally:
@@ -468,3 +472,28 @@ async def test_image_looking_ordinary_tool_text_is_not_parsed_or_erased():
         ]
     )
     assert wire[-1]["content"] == text
+
+
+@pytest.mark.asyncio
+async def test_raw_response_omits_known_bare_image_data_and_signed_url_echoes():
+    fixture = WireFixture(echo=True)
+    await fixture.complete(
+        [
+            Message(
+                role="user",
+                content=[image(), image({"type": "url", "url": URL})],
+            )
+        ]
+    )
+    # Omission is in diagnostic copies, not the model response content path.
+    assert fixture.response.text == f"echo {PNG} {URL}"
+    raw = [payload["raw"] for name, payload in fixture.events if name == "llm:response"]
+    assert len(raw) == 1
+    assert PNG not in json.dumps(raw) and URL not in json.dumps(raw)
+
+
+def test_diagnostics_do_not_guess_arbitrary_text_is_a_known_image():
+    from amplifier_module_provider_chat_completions._images import diagnostic_copy
+
+    ordinary = {"content": f"ordinary opaque text: {PNG} {URL}"}
+    assert diagnostic_copy(ordinary) == ordinary

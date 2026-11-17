@@ -24,6 +24,7 @@ from ._images import (
     UNAVAILABLE,
     contains_images,
     diagnostic_copy,
+    known_image_values,
     tool_output_text,
     user_image_part,
 )
@@ -451,7 +452,13 @@ class ChatCompletionsProvider:
         err.__cause__ = None if image_request else exc
         return err
 
-    async def _emit_event(self, name: str, payload: dict[str, Any]) -> None:
+    async def _emit_event(
+        self,
+        name: str,
+        payload: dict[str, Any],
+        *,
+        image_values: tuple[str, ...] = (),
+    ) -> None:
         """Emit an observability event via the coordinator's hooks, if available.
 
         Safely checks that self.coordinator is not None and has a hooks
@@ -465,7 +472,7 @@ class ChatCompletionsProvider:
         """
         if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
             await self.coordinator.hooks.emit(
-                name, redact_secrets(diagnostic_copy(payload))
+                name, redact_secrets(diagnostic_copy(payload, image_values))
             )
 
     def _find_missing_tool_results(
@@ -1393,6 +1400,7 @@ class ChatCompletionsProvider:
         messages = await self._repair_tool_sequence(request.messages)
         wire_messages = self._convert_messages_to_wire(messages)
         image_request = contains_images(request.messages)
+        image_values = known_image_values(request.messages)
         wire_tools = (
             self._convert_tools_to_wire(request.tools) if request.tools else None
         )
@@ -1435,7 +1443,9 @@ class ChatCompletionsProvider:
                     raw_params["tools"] = wire_tools
                 request_payload["raw"] = redact_secrets(raw_params)
 
-            await self._emit_event("llm:request", request_payload)
+            await self._emit_event(
+                "llm:request", request_payload, image_values=image_values
+            )
 
             # Per-request stream override: metadata={"stream": False} forces the
             # non-streaming path for this call only.  Uses an identity check (`is
@@ -1514,7 +1524,9 @@ class ChatCompletionsProvider:
                 except Exception:
                     pass  # Don't crash on model_dump failure
 
-            await self._emit_event("llm:response", response_payload)
+            await self._emit_event(
+                "llm:response", response_payload, image_values=image_values
+            )
             return chat_response
 
         return await retry_with_backoff(

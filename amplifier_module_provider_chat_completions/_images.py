@@ -59,6 +59,42 @@ def contains_images(value: Any) -> bool:
     return False
 
 
+def known_image_values(value: Any) -> tuple[str, ...]:
+    """Exact transport strings from actual content slots, never guessed text."""
+    if isinstance(value, ImageBlock):
+        return tuple(
+            item
+            for key in ("data", "url")
+            if isinstance(item := value.source.get(key), str) and item
+        )
+    if _is_image(value):
+        if value.get("type") == "image":
+            return known_image_values(ImageBlock(source=value["source"]))
+        if value.get("type") == "image_url":
+            url = (
+                value["image_url"].get("url")
+                if isinstance(value["image_url"], dict)
+                else None
+            )
+        else:
+            url = value.get("image_url") or value.get("data")
+        return (url,) if isinstance(url, str) and url else ()
+    if isinstance(value, Message):
+        return known_image_values(value.content)
+    if isinstance(value, ToolResultBlock):
+        return known_image_values(value.output)
+    if isinstance(value, dict):
+        return tuple(
+            part
+            for key in ("content", "output")
+            if key in value
+            for part in known_image_values(value[key])
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(part for item in value for part in known_image_values(item))
+    return ()
+
+
 def user_image_part(block: ImageBlock) -> dict[str, Any]:
     """Encode documented image_url variants; invalid sources stay explicit."""
     source = block.source
@@ -129,14 +165,20 @@ def tool_output_text(value: Any) -> str:
     return str(projected)
 
 
-def diagnostic_copy(value: Any) -> Any:
-    """Omit structured image payloads/URLs before the FIRST hook subscriber."""
+def diagnostic_copy(value: Any, image_values: tuple[str, ...] = ()) -> Any:
+    """Omit structured transports and exact known echoes in raw diagnostics.
+
+    Opaque ordinary text is not decoded or classified as base64/URLs.
+    """
     if _is_image(value):
         return {"type": "image_omitted", "reason": NOT_RETAINED}
     if isinstance(value, dict):
-        return {key: diagnostic_copy(item) for key, item in value.items()}
+        return {key: diagnostic_copy(item, image_values) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [diagnostic_copy(item) for item in value]
+        return [diagnostic_copy(item, image_values) for item in value]
     if isinstance(value, str):
-        return _DATA_IMAGE.sub(NOT_RETAINED, value)
+        result = _DATA_IMAGE.sub(NOT_RETAINED, value)
+        for transport in image_values:
+            result = result.replace(transport, NOT_RETAINED)
+        return result
     return value
