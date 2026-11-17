@@ -13,6 +13,8 @@ from amplifier_core.message_models import (
     ChatRequest,
     ImageBlock,
     Message,
+    ReasoningBlock,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolCallBlock,
@@ -606,3 +608,74 @@ async def test_tool_thinking_and_signature_never_become_output_text(stream, shap
     transport_and_diagnostics = json.dumps([fixture.requests, fixture.events])
     for private in ("private-reasoning-fixture", "private-signature", "ThinkingBlock"):
         assert private not in transport_and_diagnostics
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize("kind", ["redacted_thinking", "reasoning", "tool_call"])
+async def test_known_nonoutput_core_blocks_are_not_tool_text(stream, as_dict, kind):
+    private = {
+        "redacted_thinking": RedactedThinkingBlock(data="private-core-data"),
+        "reasoning": ReasoningBlock(
+            content=["private-core-data"], summary=["private-core-summary"]
+        ),
+        "tool_call": ToolCallBlock(
+            id="not-an-output", name="inspect", input={"value": "private-core-data"}
+        ),
+    }[kind]
+    blocks = [TextBlock(text="before"), private, image(), TextBlock(text="after")]
+    if as_dict:
+        blocks = [block.model_dump() for block in blocks]
+    fixture = WireFixture(stream)
+    wire = await fixture.complete(
+        [
+            call("one"),
+            Message(role="tool", tool_call_id="one", name="read_file", content=blocks),
+        ]
+    )
+    text = wire[1]["content"]
+    assert text.startswith("before\n[Image unavailable") and text.endswith("]\nafter")
+    assert wire[1]["tool_call_id"] == "one" and wire[1]["name"] == "read_file"
+    combined = json.dumps([fixture.requests, fixture.events])
+    assert "private-core" not in combined and "not-an-output" not in combined
+
+
+@pytest.mark.asyncio
+async def test_private_block_filter_preserves_business_fields_and_falsey_status():
+    business = {"type": "thinking", "thinking": "ordinary-record", "signature": "id"}
+    fixture = WireFixture()
+    wire = await fixture.complete(
+        [
+            call("one"),
+            Message(
+                role="tool",
+                content=[
+                    ToolResultBlock(
+                        tool_call_id="one",
+                        is_error=False,
+                        output={
+                            "record": business,
+                            "success": False,
+                            "count": 0,
+                            "empty": None,
+                            "output": {
+                                "content": [
+                                    ThinkingBlock(thinking="private-to-omit"),
+                                    TextBlock(text="metadata"),
+                                    image(),
+                                ]
+                            },
+                        },
+                    )
+                ],
+            ),
+        ]
+    )
+    text = wire[1]["content"]
+    assert str(business) in text and "is_error=False" in text
+    assert (
+        "'success': False" in text and "'count': 0" in text and "'empty': None" in text
+    )
+    assert "metadata" in text and "Image unavailable" in text
+    assert "private-to-omit" not in text and PNG not in text

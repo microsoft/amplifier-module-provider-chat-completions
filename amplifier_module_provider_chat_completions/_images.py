@@ -12,8 +12,11 @@ from urllib.parse import urlsplit
 from amplifier_core.message_models import (
     ImageBlock,
     Message,
+    ReasoningBlock,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
+    ToolCallBlock,
     ToolResultBlock,
 )
 
@@ -132,18 +135,34 @@ def user_image_part(block: ImageBlock) -> dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
-def _is_thinking(value: Any) -> bool:
-    """Recognize Core private blocks only at the known content positions below."""
-    return isinstance(value, ThinkingBlock) or (
-        isinstance(value, dict)
-        and value.get("type") == "thinking"
-        and isinstance(value.get("thinking"), str)
+def _is_nonoutput_block(value: Any) -> bool:
+    """Match the direct tool text filter, only in known content positions."""
+    if isinstance(
+        value, (ThinkingBlock, RedactedThinkingBlock, ReasoningBlock, ToolCallBlock)
+    ):
+        return True
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("type")
+    if kind == "thinking":
+        return isinstance(value.get("thinking"), str)
+    if kind == "redacted_thinking":
+        return isinstance(value.get("data"), str)
+    if kind == "reasoning":
+        return isinstance(value.get("content"), list) and isinstance(
+            value.get("summary"), list
+        )
+    return (
+        kind == "tool_call"
+        and isinstance(value.get("id"), str)
+        and isinstance(value.get("name"), str)
+        and isinstance(value.get("input"), dict)
     )
 
 
 def _tool_copy(value: Any) -> Any:
     """Replace structured pixels only; retain other fields, status and order."""
-    if _is_thinking(value):
+    if _is_nonoutput_block(value):
         return ""  # Match ordinary message conversion: never stringify signatures.
     if _is_image(value):
         return UNAVAILABLE
@@ -163,7 +182,7 @@ def _tool_copy(value: Any) -> Any:
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_tool_copy(item) for item in value if not _is_thinking(item)]
+        return [_tool_copy(item) for item in value if not _is_nonoutput_block(item)]
     return value
 
 
