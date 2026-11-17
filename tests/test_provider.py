@@ -1292,6 +1292,10 @@ class TestMessageEdgeCases:
     def test_image_block_url_format(self):
         """ImageBlock with base64 source produces correct data: URL format."""
         provider = self._get_provider()
+        data = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4"
+            "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )
         msgs = [
             Message(
                 role="user",
@@ -1301,7 +1305,7 @@ class TestMessageEdgeCases:
                         source={
                             "type": "base64",
                             "media_type": "image/png",
-                            "data": "abc123",
+                            "data": data,
                         }
                     ),
                 ],
@@ -1314,7 +1318,7 @@ class TestMessageEdgeCases:
         # Find the image_url item
         image_items = [item for item in content if item["type"] == "image_url"]
         assert len(image_items) == 1
-        assert image_items[0]["image_url"]["url"] == "data:image/png;base64,abc123"
+        assert image_items[0]["image_url"]["url"] == f"data:image/png;base64,{data}"
 
     def test_empty_content_string(self):
         """Empty string content doesn't crash and passes through as empty string."""
