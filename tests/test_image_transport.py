@@ -497,3 +497,54 @@ def test_diagnostics_do_not_guess_arbitrary_text_is_a_known_image():
 
     ordinary = {"content": f"ordinary opaque text: {PNG} {URL}"}
     assert diagnostic_copy(ordinary) == ordinary
+
+
+@pytest.mark.asyncio
+async def test_system_reminder_is_coalesced_before_image_tool_correlation():
+    fixture = WireFixture()
+    wire = await fixture.complete(
+        [
+            call("one"),
+            Message(role="system", content="current reminder"),
+            Message(
+                role="tool",
+                tool_call_id="one",
+                name="read_file",
+                content=[TextBlock(text="tool text"), image()],
+            ),
+        ]
+    )
+    assert [message["role"] for message in wire] == ["system", "assistant", "tool"]
+    assert wire[-1]["tool_call_id"] == "one"
+    assert wire[-1]["name"] == "read_file"
+    assert "Image unavailable" in wire[-1]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize("direct", [False, True])
+async def test_explicit_tool_envelope_error_status_is_preserved(is_error, direct):
+    if direct:
+        result = Message(
+            role="tool",
+            tool_call_id="one",
+            is_error=is_error,
+            content=[TextBlock(text="capture text"), image()],
+        )
+    else:
+        result = Message(
+            role="tool",
+            content=[
+                ToolResultBlock(
+                    tool_call_id="one",
+                    output=[TextBlock(text="capture text"), image()],
+                    is_error=is_error,
+                )
+            ],
+        )
+    fixture = WireFixture()
+    wire = await fixture.complete([call("one"), result])
+    text = wire[-1]["content"]
+    assert f"is_error={is_error}" in text
+    assert "capture text" in text and "Image unavailable" in text
+    assert PNG not in text

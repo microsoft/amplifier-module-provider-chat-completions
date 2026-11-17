@@ -668,6 +668,7 @@ class ChatCompletionsProvider:
                     if not message.tool_call_id:
                         raise ValueError("A string tool result requires tool_call_id")
                     msg["tool_call_id"] = message.tool_call_id
+                    msg["content"] = self._tool_status_text(message, content)
                 wire.append(msg)
                 continue
 
@@ -688,7 +689,7 @@ class ChatCompletionsProvider:
                 msg = {
                     "role": "tool",
                     "tool_call_id": message.tool_call_id,
-                    "content": text,
+                    "content": self._tool_status_text(message, text),
                 }
                 if message.name:
                     msg["name"] = message.name
@@ -753,7 +754,12 @@ class ChatCompletionsProvider:
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_call_id,
-                            "content": tool_output_text(block.output),
+                            "content": self._tool_status_text(
+                                message,
+                                self._tool_status_text(
+                                    block, tool_output_text(block.output)
+                                ),
+                            ),
                         }
                     )
                 continue
@@ -783,10 +789,25 @@ class ChatCompletionsProvider:
         return self._coalesce_system_messages(wire)
 
     @staticmethod
+    def _tool_status_text(result: Message | ToolResultBlock, text: str) -> str:
+        """Chat Completions has no is_error field; preserve explicit Core status."""
+        extras = result.model_extra or {}
+        if "is_error" not in extras:
+            return text
+        is_error = extras["is_error"]
+        if not isinstance(is_error, bool):
+            raise ValueError("Tool result is_error status must be boolean")
+        return f"[Tool result is_error={is_error}]\n{text}"
+
+    @staticmethod
     def _validate_image_tool_result(wire: list[dict[str, Any]], call_id: str) -> None:
         """Do not attribute unavailable visual evidence to an unrelated call."""
         seen: set[str] = set()
         for previous in reversed(wire):
+            # The existing final coalescer moves all system reminders to the
+            # beginning; they do not interrupt the final call/result pair.
+            if previous["role"] == "system":
+                continue
             if previous["role"] == "tool":
                 seen.add(previous["tool_call_id"])
                 continue
