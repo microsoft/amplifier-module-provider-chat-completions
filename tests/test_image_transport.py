@@ -414,3 +414,57 @@ async def test_existing_rate_limit_retry_keeps_identical_pixels_and_safe_events(
     assert any(name == "provider:retry" for name, _ in fixture.events)
     assert PNG not in json.dumps(fixture.events)
     assert URL not in json.dumps(fixture.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_content", [False, True])
+async def test_ordinary_nested_business_record_is_not_transport(with_content):
+    business = {
+        "record": {
+            "type": "image",
+            "source": {"type": "url", "url": "businessvalue"},
+        },
+        "status": False,
+        "count": 0,
+        "empty": None,
+    }
+    output = copy.deepcopy(business)
+    if with_content:
+        output["content"] = [
+            {"type": "text", "text": "actual capture"},
+            image().model_dump(),
+        ]
+    fixture = WireFixture()
+    wire = await fixture.complete(
+        [
+            call("one"),
+            Message(
+                role="tool",
+                content=[ToolResultBlock(tool_call_id="one", output=output)],
+            ),
+        ]
+    )
+    result = wire[-1]["content"]
+    if with_content:
+        assert str(business["record"]) in result
+        assert "Image unavailable" in result
+        assert "'status': False" in result and "'count': 0" in result
+        assert PNG not in result
+    else:
+        assert result == str(business)
+
+
+@pytest.mark.asyncio
+async def test_image_looking_ordinary_tool_text_is_not_parsed_or_erased():
+    text = f"Ordinary opaque text, not a content block: {URL} {PNG}"
+    fixture = WireFixture()
+    wire = await fixture.complete(
+        [
+            call("one"),
+            Message(
+                role="tool",
+                content=[ToolResultBlock(tool_call_id="one", output=text)],
+            ),
+        ]
+    )
+    assert wire[-1]["content"] == text

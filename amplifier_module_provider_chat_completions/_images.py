@@ -41,6 +41,7 @@ def _is_image(value: Any) -> bool:
 
 
 def contains_images(value: Any) -> bool:
+    """Inspect content blocks and known result envelopes, not business fields."""
     if _is_image(value):
         return True
     if isinstance(value, Message):
@@ -48,7 +49,11 @@ def contains_images(value: Any) -> bool:
     if isinstance(value, ToolResultBlock):
         return contains_images(value.output)
     if isinstance(value, dict):
-        return any(contains_images(item) for item in value.values())
+        # ToolResult.output may wrap canonical blocks in content/output.
+        # A nested product record with type=image is not a content position.
+        return any(
+            contains_images(value[key]) for key in ("content", "output") if key in value
+        )
     if isinstance(value, (list, tuple)):
         return any(contains_images(item) for item in value)
     return False
@@ -105,7 +110,10 @@ def _tool_copy(value: Any) -> Any:
             and set(value) <= {"type", "text"}
         ):
             return value["text"]
-        return {key: _tool_copy(item) for key, item in value.items()}
+        return {
+            key: _tool_copy(item) if key in ("content", "output") else item
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_tool_copy(item) for item in value]
     return value
