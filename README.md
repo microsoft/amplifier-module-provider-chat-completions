@@ -32,6 +32,36 @@ produces one wire tool message per result, in block order. An uncorrelated resul
 or a mixture of result and other content blocks is rejected before dispatch,
 rather than silently discarding evidence.
 
+### Image transport
+
+User `ImageBlock`s retain text/image order, including earlier user messages.
+Base64 PNG, JPEG, WEBP and GIF sources become `image_url` data URLs; HTTP(S)
+URL sources become `image_url` URL parts without local fetching. Encoding checks
+are not image decoding, animation checks, or proof of backend/model acceptance.
+An endpoint-compatible API does **not** imply a vision-capable model; catalog
+capabilities and limits remain unknown unless the endpoint supplies that evidence.
+
+The [Chat Completions schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+allows images in **user** content, not native tool/assistant/system/developer
+content. Unsupported positions or source variants receive payload-free
+`[Image unavailable: ... no pixels supplied ...]` text in their existing content
+slot. Tool output keeps its call ID, relative result order and nested status
+fields; a direct tool message also keeps its name. Image-bearing results require
+a preceding unmatched call. No extra user turn is invented, and saved messages
+are not changed. Existing system coalescing/developer wrapping still applies.
+Use a user image with a documented vision-capable route if visual evidence is
+required; an unavailable marker is **not** evidence that the model saw pixels.
+Historical unsupported images do not prevent a later plain-text request.
+
+Raw diagnostic copies omit structured image bytes/URLs before hooks, without
+altering the SDK request. Backend errors for image requests omit echoed details
+while retaining error classification and retry policy. This adapter has no native
+input-token count endpoint; response usage reporting is unchanged and is not an
+image-aware preflight count.
+
+Offline SDK fixtures qualify serialization only. No universal compatible-server,
+model, account, URL reachability, or live visual-understanding claim is made.
+
 ## Configuration
 
 | Key | Type | Default | Env Var |

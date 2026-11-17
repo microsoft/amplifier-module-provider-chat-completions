@@ -20,6 +20,13 @@ import openai
 
 from ._cost import compute_cost
 from ._model_listing import ModelFilters, selector_schema
+from ._images import (
+    UNAVAILABLE,
+    contains_images,
+    diagnostic_copy,
+    tool_output_text,
+    user_image_part,
+)
 
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
@@ -315,7 +322,9 @@ class ChatCompletionsProvider:
             )
         return self._client
 
-    def _translate_error(self, exc: Exception) -> KernelLLMError:
+    def _translate_error(
+        self, exc: Exception, *, image_request: bool = False
+    ) -> KernelLLMError:
         """Translate an OpenAI SDK exception to a kernel error type.
 
         Maps OpenAI SDK exceptions to the shared kernel error vocabulary so that
@@ -332,27 +341,34 @@ class ChatCompletionsProvider:
         provider = self.name
         model = self._model
         err: KernelLLMError
+        # Compatible backends can echo entire image requests, including signed
+        # URLs and bare base64, in otherwise ordinary SDK exception strings.
+        message = (
+            "Chat Completions image request failed (backend details omitted)"
+            if image_request
+            else str(exc)
+        )
 
         # Check specific OpenAI error types before the broader APIStatusError,
         # since many specific errors (RateLimitError, AuthenticationError, etc.)
         # are subclasses of APIStatusError.
         if isinstance(exc, openai.APITimeoutError):
             err = KernelLLMTimeoutError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=True,
             )
         elif isinstance(exc, openai.APIConnectionError):
             err = KernelProviderUnavailableError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=True,
             )
         elif isinstance(exc, openai.RateLimitError):
             err = KernelRateLimitError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=True,
@@ -361,42 +377,42 @@ class ChatCompletionsProvider:
             msg = str(exc).lower()
             if "context length" in msg or "too many tokens" in msg:
                 err = KernelContextLengthError(
-                    str(exc),
+                    message,
                     provider=provider,
                     model=model,
                     retryable=False,
                 )
             elif "content filter" in msg or "safety" in msg or "blocked" in msg:
                 err = KernelContentFilterError(
-                    str(exc),
+                    message,
                     provider=provider,
                     model=model,
                     retryable=False,
                 )
             else:
                 err = KernelInvalidRequestError(
-                    str(exc),
+                    message,
                     provider=provider,
                     model=model,
                     retryable=False,
                 )
         elif isinstance(exc, openai.AuthenticationError):
             err = KernelAuthenticationError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=False,
             )
         elif isinstance(exc, openai.PermissionDeniedError):
             err = KernelAccessDeniedError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=False,
             )
         elif isinstance(exc, openai.NotFoundError):
             err = KernelNotFoundError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=False,
@@ -405,7 +421,7 @@ class ChatCompletionsProvider:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             if status_code is not None and 500 <= status_code < 600:
                 err = KernelProviderUnavailableError(
-                    str(exc),
+                    message,
                     provider=provider,
                     model=model,
                     status_code=status_code,
@@ -413,26 +429,26 @@ class ChatCompletionsProvider:
                 )
             else:
                 err = KernelLLMError(
-                    str(exc),
+                    message,
                     provider=provider,
                     model=model,
                 )
         elif isinstance(exc, asyncio.TimeoutError):
             err = KernelLLMTimeoutError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=True,
             )
         else:
             err = KernelLLMError(
-                str(exc),
+                message,
                 provider=provider,
                 model=model,
                 retryable=True,
             )
 
-        err.__cause__ = exc
+        err.__cause__ = None if image_request else exc
         return err
 
     async def _emit_event(self, name: str, payload: dict[str, Any]) -> None:
@@ -448,7 +464,9 @@ class ChatCompletionsProvider:
             payload: The event payload dict.
         """
         if self.coordinator is not None and hasattr(self.coordinator, "hooks"):
-            await self.coordinator.hooks.emit(name, payload)
+            await self.coordinator.hooks.emit(
+                name, redact_secrets(diagnostic_copy(payload))
+            )
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -623,6 +641,8 @@ class ChatCompletionsProvider:
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             text_parts_dev.append(block.text)
+                        elif isinstance(block, ImageBlock):
+                            text_parts_dev.append(UNAVAILABLE)
                     text = "\n".join(text_parts_dev)
                 wire.append(
                     {
@@ -644,15 +664,41 @@ class ChatCompletionsProvider:
                 wire.append(msg)
                 continue
 
+            # Canonical direct role=tool content is not a user multimodal turn.
+            # Chat Completions tool.content permits text, not image_url parts.
+            if role == "tool" and not any(
+                isinstance(block, ToolResultBlock) for block in content
+            ):
+                if not message.tool_call_id:
+                    raise ValueError("A tool result requires tool_call_id")
+                if contains_images(content):
+                    self._validate_image_tool_result(wire, message.tool_call_id)
+                    text = tool_output_text(content)
+                else:
+                    text = "\n".join(
+                        block.text for block in content if isinstance(block, TextBlock)
+                    )
+                msg = {
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id,
+                    "content": text,
+                }
+                if message.name:
+                    msg["name"] = message.name
+                wire.append(msg)
+                continue
+
             # List of content blocks — iterate and classify.
             text_parts: list[str] = []
             tool_calls_wire: list[dict[str, Any]] = []
-            image_parts: list[dict[str, Any]] = []
+            ordered_parts: list[dict[str, Any]] = []
+            has_image = False
             tool_result_blocks: list[ToolResultBlock] = []
 
             for block in content:
                 if isinstance(block, TextBlock):
                     text_parts.append(block.text)
+                    ordered_parts.append({"type": "text", "text": block.text})
                 elif isinstance(block, ThinkingBlock):
                     pass  # Silently drop thinking blocks
                 elif isinstance(block, ToolCallBlock):
@@ -669,9 +715,15 @@ class ChatCompletionsProvider:
                 elif isinstance(block, ToolResultBlock):
                     tool_result_blocks.append(block)
                 elif isinstance(block, ImageBlock):
-                    src = block.source
-                    url = f"data:{src['media_type']};base64,{src['data']}"
-                    image_parts.append({"type": "image_url", "image_url": {"url": url}})
+                    has_image = True
+                    part = (
+                        user_image_part(block)
+                        if role == "user"
+                        else {"type": "text", "text": UNAVAILABLE}
+                    )
+                    ordered_parts.append(part)
+                    if part["type"] == "text":
+                        text_parts.append(part["text"])
 
             if tool_result_blocks:
                 # Chat Completions needs one correlated tool message per result.
@@ -683,26 +735,26 @@ class ChatCompletionsProvider:
                 for block in tool_result_blocks:
                     if not block.tool_call_id:
                         raise ValueError("A tool result requires tool_call_id")
+                    if contains_images(block.output):
+                        if (
+                            message.tool_call_id
+                            and message.tool_call_id != block.tool_call_id
+                        ):
+                            raise ValueError("Image tool result IDs disagree")
+                        self._validate_image_tool_result(wire, block.tool_call_id)
                     wire.append(
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_call_id,
-                            "content": str(block.output),
+                            "content": tool_output_text(block.output),
                         }
                     )
                 continue
 
             msg: dict[str, Any] = {"role": role}
 
-            if image_parts:
-                # Build a multimodal content array.
-                content_array: list[dict[str, Any]] = []
-                if text_parts:
-                    content_array.append(
-                        {"type": "text", "text": "\n".join(text_parts)}
-                    )
-                content_array.extend(image_parts)
-                msg["content"] = content_array
+            if has_image and any(p["type"] == "image_url" for p in ordered_parts):
+                msg["content"] = ordered_parts
             elif text_parts:
                 msg["content"] = "\n".join(text_parts)
             else:
@@ -722,6 +774,24 @@ class ChatCompletionsProvider:
         # opaque HTTP 500 that strict chat templates (e.g. Qwen3 on vLLM) return
         # when a system message appears after user/assistant turns.
         return self._coalesce_system_messages(wire)
+
+    @staticmethod
+    def _validate_image_tool_result(wire: list[dict[str, Any]], call_id: str) -> None:
+        """Do not attribute unavailable visual evidence to an unrelated call."""
+        seen: set[str] = set()
+        for previous in reversed(wire):
+            if previous["role"] == "tool":
+                seen.add(previous["tool_call_id"])
+                continue
+            pending = (
+                {call["id"] for call in previous.get("tool_calls", [])}
+                if previous["role"] == "assistant"
+                else set()
+            )
+            if call_id in pending and call_id not in seen:
+                return
+            break
+        raise ValueError("Image tool result requires a preceding unmatched tool call")
 
     @staticmethod
     def _coalesce_system_messages(
@@ -1134,7 +1204,11 @@ class ChatCompletionsProvider:
                         "request_id": request_id,
                         "error": {
                             "type": type(_stream_exc).__name__,
-                            "msg": str(_stream_exc),
+                            "msg": (
+                                "Image request stream failed (backend details omitted)"
+                                if contains_images(request.messages)
+                                else str(_stream_exc)
+                            ),
                         },
                     },
                 )
@@ -1318,6 +1392,7 @@ class ChatCompletionsProvider:
         """
         messages = await self._repair_tool_sequence(request.messages)
         wire_messages = self._convert_messages_to_wire(messages)
+        image_request = contains_images(request.messages)
         wire_tools = (
             self._convert_tools_to_wire(request.tools) if request.tools else None
         )
@@ -1389,7 +1464,7 @@ class ChatCompletionsProvider:
                         )
             except Exception as exc:
                 duration_ms = (time.monotonic() - start_time) * 1000
-                kernel_error = self._translate_error(exc)
+                kernel_error = self._translate_error(exc, image_request=image_request)
                 await self._emit_event(
                     "llm:response",
                     {
@@ -1399,6 +1474,8 @@ class ChatCompletionsProvider:
                         "error_type": type(exc).__name__,
                     },
                 )
+                if image_request:
+                    raise kernel_error from None
                 raise kernel_error from exc
 
             duration_ms = (time.monotonic() - start_time) * 1000
