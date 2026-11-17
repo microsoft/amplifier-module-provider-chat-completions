@@ -13,6 +13,7 @@ from amplifier_core.message_models import (
     ImageBlock,
     Message,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
 )
 
@@ -131,8 +132,19 @@ def user_image_part(block: ImageBlock) -> dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
+def _is_thinking(value: Any) -> bool:
+    """Recognize Core private blocks only at the known content positions below."""
+    return isinstance(value, ThinkingBlock) or (
+        isinstance(value, dict)
+        and value.get("type") == "thinking"
+        and isinstance(value.get("thinking"), str)
+    )
+
+
 def _tool_copy(value: Any) -> Any:
     """Replace structured pixels only; retain other fields, status and order."""
+    if _is_thinking(value):
+        return ""  # Match ordinary message conversion: never stringify signatures.
     if _is_image(value):
         return UNAVAILABLE
     if isinstance(value, TextBlock):
@@ -151,7 +163,7 @@ def _tool_copy(value: Any) -> Any:
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_tool_copy(item) for item in value]
+        return [_tool_copy(item) for item in value if not _is_thinking(item)]
     return value
 
 

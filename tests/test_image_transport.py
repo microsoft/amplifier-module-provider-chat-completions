@@ -14,6 +14,7 @@ from amplifier_core.message_models import (
     ImageBlock,
     Message,
     TextBlock,
+    ThinkingBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
@@ -548,3 +549,60 @@ async def test_explicit_tool_envelope_error_status_is_preserved(is_error, direct
     assert f"is_error={is_error}" in text
     assert "capture text" in text and "Image unavailable" in text
     assert PNG not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "shape", ["direct", "direct_dict", "nested", "nested_dict", "no_image"]
+)
+async def test_tool_thinking_and_signature_never_become_output_text(stream, shape):
+    fixture = WireFixture(stream)
+    blocks = [
+        TextBlock(text="before"),
+        ThinkingBlock(
+            thinking="private-reasoning-fixture", signature="private-signature"
+        ),
+    ]
+    if shape != "no_image":
+        blocks.append(image())
+    blocks.append(TextBlock(text="after"))
+    if shape.endswith("_dict"):
+        blocks = [block.model_dump() for block in blocks]
+    if shape.startswith("nested"):
+        result = Message(
+            role="tool",
+            content=[
+                ToolResultBlock(
+                    tool_call_id="one",
+                    output={"status": False, "content": blocks},
+                )
+            ],
+        )
+    else:
+        result = Message(
+            role="tool", tool_call_id="one", name="read_file", content=blocks
+        )
+    wire = await fixture.complete(
+        [Message(role="user", content=[image()]), call("one"), result]
+    )
+    assert [message["role"] for message in wire] == ["user", "assistant", "tool"]
+    # Preserve genuine user pixels; native tool-image support stays unavailable.
+    assert wire[0]["content"][0]["image_url"]["url"].endswith(PNG)
+    assert wire[2]["tool_call_id"] == "one"
+    text = wire[2]["content"]
+    assert text.index("before") < text.index("after")
+    if shape == "no_image":
+        assert text == "before\nafter"
+    else:
+        assert (
+            text.index("before") < text.index("Image unavailable") < text.index("after")
+        )
+        assert PNG not in text
+    if shape.startswith("nested"):
+        assert "'status': False" in text
+    else:
+        assert wire[2]["name"] == "read_file"
+    transport_and_diagnostics = json.dumps([fixture.requests, fixture.events])
+    for private in ("private-reasoning-fixture", "private-signature", "ThinkingBlock"):
+        assert private not in transport_and_diagnostics
